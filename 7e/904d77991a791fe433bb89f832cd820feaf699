@@ -1,0 +1,24 @@
+.gitignore
+  h_49201e0a695903 1-5
+README.md
+  h_49201e0a695903 1-324
+config.example.json
+  h_49201e0a695903 1-29
+package.json
+  h_49201e0a695903 1-15
+proxy.js
+  h_49201e0a695903 1-820
+test/proxy.test.js
+  h_49201e0a695903 1-401
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "7e904d77991a791fe433bb89f832cd820feaf699",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
