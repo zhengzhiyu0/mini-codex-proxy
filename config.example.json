@@ -1,0 +1,29 @@
+{
+  "host": "127.0.0.1",
+  "port": 8317,
+  "upstream": {
+    "name": "naiccc",
+    "baseUrl": "https://example.com/v1",
+    "apiKey": ""
+  },
+  "clientApiKey": "change-this-local-key",
+  "forwardClientAuthorization": false,
+  "models": {
+    "gpt-5.6-sol": "gpt-5.4",
+    "gpt-5.6-luna": "gpt-5.4-mini",
+    "gpt-5.6-terra": "gpt-5.4"
+  },
+  "injectMappedModels": true,
+  "logging": {
+    "enabled": true
+  },
+  "progress": {
+    "enabled": true,
+    "color": true,
+    "refreshIntervalMs": 100
+  },
+  "timeouts": {
+    "connectTimeoutMs": 30000
+  },
+  "debug": false
+}
