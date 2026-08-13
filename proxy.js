@@ -99,6 +99,97 @@ function normalizeBaseUrl(value, fieldName) {
   return url.toString().replace(/\/$/, '');
 }
 
+function normalizeModels(models, fieldName) {
+  const value = models === undefined ? {} : models;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Invalid ${fieldName}: expected an object`);
+  }
+  for (const [alias, target] of Object.entries(value)) {
+    if (!alias || typeof target !== 'string' || !target) {
+      throw new Error(`Invalid model mapping for ${alias || '<empty>'} in ${fieldName}`);
+    }
+  }
+  return { ...value };
+}
+
+function normalizeUpstreams(input, fieldPrefix) {
+  if (Array.isArray(input.upstreams) && input.upstreams.length > 0) {
+    return input.upstreams.map((upstream, index) => {
+      if (!upstream || typeof upstream !== 'object') {
+        throw new Error(`Invalid ${fieldPrefix}upstreams[${index}]`);
+      }
+      return {
+        name: typeof upstream.name === 'string' && upstream.name.trim()
+          ? upstream.name.trim()
+          : `upstream-${index + 1}`,
+        baseUrl: normalizeBaseUrl(upstream.baseUrl, `${fieldPrefix}upstreams[${index}].baseUrl`),
+        apiKey: typeof upstream.apiKey === 'string' ? upstream.apiKey : '',
+        priority: Number.isFinite(upstream.priority) ? upstream.priority : 0,
+      };
+    }).sort((a, b) => b.priority - a.priority);
+  }
+
+  const upstream = input.upstream;
+  if (!upstream || typeof upstream !== 'object') {
+    throw new Error(`Missing ${fieldPrefix}upstream.baseUrl`);
+  }
+  return [{
+    name: typeof upstream.name === 'string' && upstream.name.trim() ? upstream.name.trim() : 'upstream',
+    baseUrl: normalizeBaseUrl(upstream.baseUrl, `${fieldPrefix}upstream.baseUrl`),
+    apiKey: typeof upstream.apiKey === 'string' ? upstream.apiKey : '',
+    priority: 0,
+  }];
+}
+
+function normalizeGroup(input, fieldPrefix) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error(`Invalid ${fieldPrefix.replace(/\.$/, '') || 'group'}`);
+  }
+  return {
+    upstreams: normalizeUpstreams(input, fieldPrefix),
+    models: normalizeModels(input.models, `${fieldPrefix}models`),
+    injectMappedModels: input.injectMappedModels === true,
+    overrideModelList: input.overrideModelList === true,
+  };
+}
+
+function resolveGroups(input) {
+  if (input.groups === undefined) {
+    return {
+      groups: { default: normalizeGroup(input, '') },
+      activeGroup: 'default',
+    };
+  }
+
+  if (!input.groups || typeof input.groups !== 'object' || Array.isArray(input.groups)) {
+    throw new Error('Invalid groups: expected an object');
+  }
+
+  const names = Object.keys(input.groups);
+  if (names.length === 0) {
+    throw new Error('groups must contain at least one group');
+  }
+
+  const groups = {};
+  for (const name of names) {
+    if (!name.trim()) {
+      throw new Error('Invalid group name');
+    }
+    groups[name] = normalizeGroup(input.groups[name], `groups.${name}.`);
+  }
+
+  const envGroup = typeof process.env.MINI_CODEX_PROXY_GROUP === 'string'
+    ? process.env.MINI_CODEX_PROXY_GROUP.trim()
+    : '';
+  const configuredGroup = typeof input.activeGroup === 'string' ? input.activeGroup.trim() : '';
+  const activeGroup = envGroup || configuredGroup || names[0];
+  if (!Object.prototype.hasOwnProperty.call(groups, activeGroup)) {
+    throw new Error(`Unknown activeGroup: ${activeGroup}`);
+  }
+
+  return { groups, activeGroup };
+}
+
 function validateAndNormalizeConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('config.json must contain a JSON object');
@@ -114,43 +205,8 @@ function validateAndNormalizeConfig(input) {
     throw new Error('Invalid port');
   }
 
-  let upstreams;
-  if (Array.isArray(input.upstreams) && input.upstreams.length > 0) {
-    upstreams = input.upstreams.map((upstream, index) => {
-      if (!upstream || typeof upstream !== 'object') {
-        throw new Error(`Invalid upstreams[${index}]`);
-      }
-      return {
-        name: typeof upstream.name === 'string' && upstream.name.trim()
-          ? upstream.name.trim()
-          : `upstream-${index + 1}`,
-        baseUrl: normalizeBaseUrl(upstream.baseUrl, `upstreams[${index}].baseUrl`),
-        apiKey: typeof upstream.apiKey === 'string' ? upstream.apiKey : '',
-        priority: Number.isFinite(upstream.priority) ? upstream.priority : 0,
-      };
-    }).sort((a, b) => b.priority - a.priority);
-  } else {
-    const upstream = input.upstream;
-    if (!upstream || typeof upstream !== 'object') {
-      throw new Error('Missing upstream.baseUrl');
-    }
-    upstreams = [{
-      name: typeof upstream.name === 'string' && upstream.name.trim() ? upstream.name.trim() : 'upstream',
-      baseUrl: normalizeBaseUrl(upstream.baseUrl, 'upstream.baseUrl'),
-      apiKey: typeof upstream.apiKey === 'string' ? upstream.apiKey : '',
-      priority: 0,
-    }];
-  }
-
-  const models = input.models === undefined ? {} : input.models;
-  if (!models || typeof models !== 'object' || Array.isArray(models)) {
-    throw new Error('Invalid models: expected an object');
-  }
-  for (const [alias, target] of Object.entries(models)) {
-    if (!alias || typeof target !== 'string' || !target) {
-      throw new Error(`Invalid model mapping for ${alias || '<empty>'}`);
-    }
-  }
+  const { groups, activeGroup } = resolveGroups(input);
+  const group = groups[activeGroup];
 
   const connectTimeoutMs = input.timeouts?.connectTimeoutMs === undefined
     ? 30000
@@ -169,11 +225,14 @@ function validateAndNormalizeConfig(input) {
   return {
     host: host.trim(),
     port,
-    upstreams,
+    groups,
+    activeGroup,
+    upstreams: group.upstreams,
     clientApiKey: typeof input.clientApiKey === 'string' ? input.clientApiKey : '',
     forwardClientAuthorization: input.forwardClientAuthorization === true,
-    models: { ...models },
-    injectMappedModels: input.injectMappedModels === true,
+    models: group.models,
+    injectMappedModels: group.injectMappedModels,
+    overrideModelList: group.overrideModelList,
     logging: { enabled: input.logging?.enabled !== false },
     progress: {
       enabled: input.progress?.enabled === true,
@@ -370,7 +429,7 @@ function serializeMonitorRequest(metrics, now = process.hrtime.bigint()) {
   };
 }
 
-function createMonitorState() {
+function createMonitorState(config) {
   const active = new Map();
   const history = [];
   let latest = null;
@@ -394,6 +453,8 @@ function createMonitorState() {
       return {
         service: 'mini-codex-proxy',
         online: true,
+        group: config.activeGroup,
+        groups: Object.keys(config.groups),
         uptimeMs: Date.now() - startedAt,
         activeCount: activeRequests.length,
         activeRequests,
@@ -402,6 +463,18 @@ function createMonitorState() {
         history: history.map((item) => ({ ...item })),
       };
     },
+  };
+}
+
+function buildLocalModelList(mappings) {
+  return {
+    object: 'list',
+    data: Object.keys(mappings).map((alias) => ({
+      id: alias,
+      object: 'model',
+      created: 0,
+      owned_by: 'mini-codex-proxy',
+    })),
   };
 }
 
@@ -579,7 +652,7 @@ function createProxyServer(rawConfig, options = {}) {
   const config = validateAndNormalizeConfig(rawConfig);
   const logOutput = options.log || defaultLog;
   const progress = createTerminalProgress(config, options.progress);
-  const monitor = createMonitorState();
+  const monitor = createMonitorState(config);
   const clientSockets = new Set();
 
   function log(line) {
@@ -626,6 +699,11 @@ function createProxyServer(rawConfig, options = {}) {
       sendJson(response, 401, {
         error: { message: 'Invalid API key', type: 'authentication_error' },
       });
+      return;
+    }
+
+    if (endpoint.name === 'models' && config.overrideModelList) {
+      sendJson(response, 200, buildLocalModelList(config.models));
       return;
     }
 
@@ -890,7 +968,9 @@ function startFromConfig() {
     process.exitCode = 1;
   });
   server.listen(config.port, config.host, () => {
-    process.stdout.write(`mini-codex-proxy listening on http://${config.host}:${config.port}\n`);
+    process.stdout.write(
+      `mini-codex-proxy listening on http://${config.host}:${config.port} (group=${config.activeGroup})\n`,
+    );
     if (config.host === '0.0.0.0' || config.host === '::') {
       process.stderr.write('WARNING: proxy is exposed to the network.\n');
     }
@@ -915,6 +995,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildLocalModelList,
   buildUpstreamUrl,
   createProxyServer,
   loadConfig,

@@ -39,17 +39,33 @@ Copy-Item .\config.example.json .\config.json -Force
 {
   "host": "127.0.0.1",
   "port": 8317,
-  "upstream": {
-    "name": "naiccc",
-    "baseUrl": "https://example.com/v1",
-    "apiKey": "sk-your-upstream-key"
+  "activeGroup": "naiccc",
+  "groups": {
+    "naiccc": {
+      "upstream": {
+        "name": "naiccc",
+        "baseUrl": "https://example.com/v1",
+        "apiKey": "sk-your-upstream-key"
+      },
+      "models": {
+        "gpt-5.6-luna": "gpt-5.4-mini"
+      },
+      "injectMappedModels": true
+    },
+    "grok": {
+      "upstream": {
+        "name": "grok",
+        "baseUrl": "https://api.x.ai/v1",
+        "apiKey": "sk-your-grok-key"
+      },
+      "models": {
+        "gpt-5.6-sol": "grok-4.6"
+      },
+      "overrideModelList": true
+    }
   },
   "clientApiKey": "your-own-local-key",
   "forwardClientAuthorization": false,
-  "models": {
-    "gpt-5.6-luna": "gpt-5.4-mini"
-  },
-  "injectMappedModels": true,
   "logging": {
     "enabled": true
   },
@@ -83,6 +99,19 @@ npm start
 
 ```text
 http://127.0.0.1:8317
+```
+
+启动日志会带上当前组名：
+
+```text
+mini-codex-proxy listening on http://127.0.0.1:8317 (group=naiccc)
+```
+
+临时换组不必改 `config.json`：
+
+```powershell
+$env:MINI_CODEX_PROXY_GROUP = 'grok'
+node .\proxy.js
 ```
 
 按 `Ctrl+C` 可正常关闭本地监听和现有连接。
@@ -184,9 +213,49 @@ body.model = configuredMapping[body.model] ?? body.model;
 
 `debug=true` 时，代理会旁路观察是否出现 `response.completed`、`response.failed` 和 `[DONE]`。观察器只读数据块，不改变也不重新生成事件。
 
+## 配置组
+
+`groups` 用来保存多套上游和模型映射。启动时只激活一组：
+
+1. 环境变量 `MINI_CODEX_PROXY_GROUP`
+2. `config.json` 的 `activeGroup`
+3. `groups` 里的第一个组
+
+每一组都可以单独写：
+
+- `upstream` 或 `upstreams`
+- `models`
+- `injectMappedModels`
+- `overrideModelList`
+
+例如 Codex 界面继续显示 `gpt-5.6-sol`，实际打到 grok：
+
+```json
+{
+  "activeGroup": "grok",
+  "groups": {
+    "grok": {
+      "upstream": {
+        "name": "grok",
+        "baseUrl": "https://api.x.ai/v1",
+        "apiKey": "sk-your-grok-key"
+      },
+      "models": {
+        "gpt-5.6-sol": "grok-4.6"
+      },
+      "overrideModelList": true
+    }
+  }
+}
+```
+
+不写 `groups` 时，顶层 `upstream` / `upstreams` / `models` 仍可直接使用，会自动收成名为 `default` 的一组。
+
 ## 模型列表
 
-`GET /v1/models` 默认转发到上游。`injectMappedModels=true` 时，代理只对这个模型列表接口缓冲并解析成功的 JSON 响应，然后把 `models` 中的 alias 追加到 `data` 数组。
+`GET /v1/models` 默认转发到当前组的上游。`injectMappedModels=true` 时，代理只对这个模型列表接口缓冲并解析成功的 JSON 响应，然后把当前组 `models` 中的 alias 追加到 `data` 数组。
+
+如果只想让 Codex 看到你自己的模型名，把当前组的 `overrideModelList` 设为 `true`。此时 `/v1/models` 不再访问上游，只返回该组 `models` 的左侧 alias。`overrideModelList=true` 时会忽略 `injectMappedModels`。
 
 Responses 接口不受该逻辑影响，永远不会为模型注入而缓冲。
 
@@ -330,20 +399,24 @@ GET http://127.0.0.1:8317/_mini/status
 
 ```json
 {
-  "upstreams": [
-    {
-      "name": "naiccc",
-      "baseUrl": "https://primary.example.com/v1",
-      "apiKey": "sk-primary",
-      "priority": 100
-    },
-    {
-      "name": "sixoner",
-      "baseUrl": "https://secondary.example.com/v1",
-      "apiKey": "sk-secondary",
-      "priority": 10
+  "groups": {
+    "naiccc": {
+      "upstreams": [
+        {
+          "name": "naiccc",
+          "baseUrl": "https://primary.example.com/v1",
+          "apiKey": "sk-primary",
+          "priority": 100
+        },
+        {
+          "name": "sixoner",
+          "baseUrl": "https://secondary.example.com/v1",
+          "apiKey": "sk-secondary",
+          "priority": 10
+        }
+      ]
     }
-  ]
+  }
 }
 ```
 
@@ -370,7 +443,11 @@ Copy-Item .\config.example.json .\config.json
 
 ### `Missing upstream.baseUrl`
 
-检查 `upstream.baseUrl` 是否存在，或使用非空的 `upstreams` 数组。
+检查当前组的 `upstream.baseUrl` 是否存在，或使用非空的 `upstreams` 数组。
+
+### `Unknown activeGroup`
+
+`activeGroup` 或环境变量 `MINI_CODEX_PROXY_GROUP` 必须对应 `groups` 里已有的组名。
 
 ### `Invalid port`
 

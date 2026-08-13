@@ -51,6 +51,7 @@ function makeConfig(upstreamPort, overrides = {}) {
     forwardClientAuthorization: false,
     models: { 'gpt-5.6-sol': 'gpt-5.4' },
     injectMappedModels: true,
+    overrideModelList: false,
     logging: { enabled: true },
     timeouts: { connectTimeoutMs: 1000 },
     debug: false,
@@ -231,6 +232,30 @@ test('upstream 401, 429, and 502 status/body pairs are preserved', async (t) => 
   }
 });
 
+test('overrideModelList returns only configured aliases and does not call upstream', async (t) => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ object: 'list', data: [{ id: 'should-not-appear', object: 'model' }] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer(makeConfig(upstreamPort, {
+    models: { 'gpt-5.6-sol': 'grok4.6', 'gpt-5.6-luna': 'gpt-5.4-mini' },
+    injectMappedModels: true,
+    overrideModelList: true,
+  }));
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  const result = await request({ port: proxyPort, path: '/v1/models', method: 'GET' });
+  const parsed = JSON.parse(result.body.toString('utf8'));
+  assert.equal(result.statusCode, 200);
+  assert.equal(upstreamHits, 0);
+  assert.deepEqual(parsed.data.map((model) => model.id), ['gpt-5.6-sol', 'gpt-5.6-luna']);
+  assert.ok(parsed.data.every((model) => model.owned_by === 'mini-codex-proxy'));
+});
+
 test('mapped aliases are injected into successful models response', async (t) => {
   const upstream = http.createServer((req, res) => {
     assert.equal(req.url, '/v1/models');
@@ -367,6 +392,69 @@ test('local monitor status is in-memory, loopback-only, and excludes prompt/SSE 
   assert.equal(finalSnapshot.history.length, 1);
   assert.equal(finalSnapshot.history[0].state, 'completed');
   assert.doesNotMatch(finalStatus.body.toString('utf8'), /do-not-expose-this-prompt|secret-answer|monitor-local-key/);
+  assert.equal(snapshot.group, 'default');
+});
+
+test('activeGroup selects that group upstreams and model mapping', async (t) => {
+  let received;
+  const unused = http.createServer(() => {
+    throw new Error('inactive group should not be contacted');
+  });
+  const grok = http.createServer(async (req, res) => {
+    if (req.url === '/v1/models') {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end('{"error":"should-not-call-upstream"}');
+      return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = {
+      url: req.url,
+      authorization: req.headers.authorization,
+      body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+    };
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"resp_group"}');
+  });
+  const unusedPort = await listen(unused);
+  const grokPort = await listen(grok);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    activeGroup: 'grok',
+    groups: {
+      naiccc: {
+        upstream: { name: 'naiccc', baseUrl: `http://127.0.0.1:${unusedPort}/v1`, apiKey: 'naiccc-key' },
+        models: { 'gpt-5.6-sol': 'gpt-5.4' },
+      },
+      grok: {
+        upstream: { name: 'grok', baseUrl: `http://127.0.0.1:${grokPort}/v1`, apiKey: 'grok-key' },
+        models: { 'gpt-5.6-sol': 'grok-4.6' },
+        overrideModelList: true,
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(unused); await close(grok); });
+
+  const models = await request({ port: proxyPort, path: '/v1/models', method: 'GET' });
+  assert.equal(models.statusCode, 200);
+  assert.deepEqual(JSON.parse(models.body.toString('utf8')).data.map((model) => model.id), ['gpt-5.6-sol']);
+
+  const result = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+  assert.equal(result.statusCode, 200);
+  assert.equal(received.authorization, 'Bearer grok-key');
+  assert.equal(received.body.model, 'grok-4.6');
+
+  const status = await request({ port: proxyPort, path: '/_mini/status', method: 'GET' });
+  const snapshot = JSON.parse(status.body.toString('utf8'));
+  assert.equal(snapshot.group, 'grok');
+  assert.deepEqual(snapshot.groups, ['naiccc', 'grok']);
 });
 
 test('failover happens before downstream headers/body are sent', async (t) => {
