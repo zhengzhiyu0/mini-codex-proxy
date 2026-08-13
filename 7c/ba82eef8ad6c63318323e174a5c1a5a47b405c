@@ -1,0 +1,46 @@
+config.example.json
+  s_58508bf6f4db4e::t_e1031085780dce 4-30
+test/proxy.test.js
+  s_58508bf6f4db4e::t_c5080bb554e9b1 235-258
+  s_58508bf6f4db4e::t_f8efec0049072f 395-457
+  s_58508bf6f4db4e::t_9e7a85c29dad03 54
+README.md
+  s_58508bf6f4db4e::t_6d633c388504c4 446-450
+  s_58508bf6f4db4e::t_0c6bd7a60a86c6 216-231,235-248,251-253,256,258
+  s_58508bf6f4db4e::t_b342425b92325f 104-116
+  s_58508bf6f4db4e::t_a1de21202b76fb 232-234,249-250,257
+  s_58508bf6f4db4e::t_0c2dc30845419f 42-65
+  s_58508bf6f4db4e::t_c90a028b4d7562 402-417,419
+proxy.js
+  s_58508bf6f4db4e::t_403fe99afdb935 102-105,107-110,112-113,115,117,119,125,132-134,136-176,178-195,198-209
+  s_58508bf6f4db4e::t_1f98b7d4fc2d3e 655
+  s_58508bf6f4db4e::t_82cbe0c49b9cd5 705-709
+  s_58508bf6f4db4e::t_ea03a479e6b91c 228-230,233-235
+  s_58508bf6f4db4e::t_d47f2e117312c5 469-480
+  s_58508bf6f4db4e::t_0f9a920e8d646a 432
+  s_58508bf6f4db4e::t_59c93f1b02328b 456-457
+  s_58508bf6f4db4e::t_1f92b9b560ee1c 971-973
+  s_58508bf6f4db4e::t_19452075654a48 998
+  s_58508bf6f4db4e::t_50ceb858b657e2 210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7cba82eef8ad6c63318323e174a5c1a5a47b405c",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  },
+  "sessions": {
+    "s_58508bf6f4db4e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a2b7836-6282-4a15-975d-c72dafb78f66",
+        "model": "grok-4.6"
+      },
+      "human_author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
