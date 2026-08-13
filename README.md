@@ -243,6 +243,87 @@ Responses 接口不受该逻辑影响，永远不会为模型注入而缓冲。
 - `tools` 内容
 - SSE 正文
 
+## Windows 置顶悬浮窗
+
+项目附带一个 PowerShell 7 + WPF 的轻量监控小窗，不需要 Electron、npm 依赖或数据库。它只读取代理内存中的当前/最近一次请求状态；历史仅保存在本次代理进程的内存中。
+
+先启动代理：
+
+```powershell
+Set-Location D:\dev\mini-codex-proxy
+node .\proxy.js
+```
+
+再开第二个 PowerShell 窗口启动悬浮窗：
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File .\monitor.ps1
+```
+
+或者一键启动代理和悬浮窗：
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File .\start-monitor.ps1
+```
+
+如果代理已经在运行，只启动窗口：
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File .\start-monitor.ps1 -NoProxy
+```
+
+小窗特性：
+
+- 无边框、半透明、圆角、始终置顶。
+- 横条中不显示应用标题和副标题，拖动横条空白区域即可移动。
+- 默认使用紧凑尺寸，适合固定在屏幕角落。
+- `◷` 按钮查看本次启动以来的已完成请求历史；只保存在内存，重启代理后清空。
+- `⤢` 按钮放大到详细视图，再次点击 `⤡` 还原紧凑尺寸。
+- `—` 按钮折叠/展开详情。
+- `刷新` 立即读取一次状态，默认每 250ms 自动刷新。
+- `×` 关闭小窗，不会关闭代理。
+- 成功、失败、流式中、等待中使用不同颜色。
+- 显示模型映射、当前上游、HTTP 状态、上行/下行字节、首包、首字和总耗时。
+
+### 切换悬浮窗主题
+
+在 `config.json` 中设置 `monitor.theme`：
+
+```json
+{
+  "monitor": {
+    "enabled": true,
+    "theme": "light-mint"
+  }
+}
+```
+
+可用主题：
+
+- `dark-green`：默认深绿色。
+- `light-mint`：浅薄荷绿色。
+- `light-ivory`：浅象牙白。
+- `light-sky`：浅蓝色。
+- `light` 是 `light-mint` 的简写，`dark` 是 `dark-green` 的简写。
+
+修改后关闭并重新启动悬浮窗即可生效，不必重启代理。如果代理通过环境变量 `MINI_CODEX_PROXY_CONFIG` 使用其他配置文件，悬浮窗会读取同一文件；也可以用 `-ConfigPath` 显式指定：
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File .\monitor.ps1 -ConfigPath D:\path\to\config.json
+```
+
+代理提供一个仅限回环地址访问的内存状态接口：
+
+```text
+GET http://127.0.0.1:8317/_mini/status
+```
+
+该接口只允许 `127.0.0.1`、`::1` 和 IPv4-mapped loopback 地址访问，并返回当前活跃请求与最近一次请求的摘要。它不会返回 API Key、prompt、`input`、tools 或 SSE 正文。设置 `"monitor": { "enabled": false }` 可关闭这个接口。
+
+状态接口还会返回当前代理进程启动以来最多 100 条已完成请求摘要，悬浮窗的“历”按钮使用的就是这段内存数据；不写入文件，也不保留跨重启历史。
+
+悬浮窗和代理建议分别运行在两个终端；关闭悬浮窗不会中断 Codex 请求，也不会改变 Responses SSE 透传。
+
 ## 可选故障切换
 
 第一版已经支持简单的优先级故障切换。把单个 `upstream` 改为：

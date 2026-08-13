@@ -302,6 +302,73 @@ test('clientApiKey protects the proxy and is never forwarded upstream', async (t
   assert.ok(logs.every((line) => !line.includes('server-secret-key')));
 });
 
+test('local monitor status is in-memory, loopback-only, and excludes prompt/SSE content', async (t) => {
+  const upstream = await (async () => {
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"secret-answer"}\n\n');
+      server.__response = res;
+    });
+    const port = await listen(server);
+    return { server, port };
+  })();
+  const proxy = createProxyServer(makeConfig(upstream.port, {
+    clientApiKey: 'monitor-local-key',
+    monitor: { enabled: true },
+  }));
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream.server); });
+
+  const requestPromise = new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port: proxyPort,
+      path: '/v1/responses',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer monitor-local-key',
+      },
+    }, (res) => {
+      res.on('error', reject);
+      res.on('data', () => {});
+      res.on('end', resolve);
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      input: 'do-not-expose-this-prompt',
+      stream: true,
+    }));
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const status = await request({
+    port: proxyPort,
+    path: '/_mini/status',
+    method: 'GET',
+    headers: {},
+  });
+  assert.equal(status.statusCode, 200);
+  const snapshot = JSON.parse(status.body.toString('utf8'));
+  assert.equal(snapshot.service, 'mini-codex-proxy');
+  assert.ok(snapshot.activeCount >= 1);
+  assert.ok(snapshot.activeRequests[0].requestBytes > 0);
+  assert.equal(snapshot.activeRequests[0].model, 'gpt-5.6-sol');
+  assert.equal(snapshot.activeRequests[0].mappedModel, 'gpt-5.4');
+  assert.doesNotMatch(status.body.toString('utf8'), /do-not-expose-this-prompt|secret-answer|monitor-local-key/);
+
+  upstream.server.__response.end('event: response.completed\ndata: {"type":"response.completed"}\n\n');
+  await requestPromise;
+  const finalStatus = await request({ port: proxyPort, path: '/_mini/status', method: 'GET' });
+  const finalSnapshot = JSON.parse(finalStatus.body.toString('utf8'));
+  assert.equal(finalSnapshot.activeCount, 0);
+  assert.equal(finalSnapshot.latest.state, 'completed');
+  assert.ok(finalSnapshot.latest.firstOutputTextMs !== null);
+  assert.equal(finalSnapshot.history.length, 1);
+  assert.equal(finalSnapshot.history[0].state, 'completed');
+  assert.doesNotMatch(finalStatus.body.toString('utf8'), /do-not-expose-this-prompt|secret-answer|monitor-local-key/);
+});
+
 test('failover happens before downstream headers/body are sent', async (t) => {
   const first = http.createServer((req, res) => {
     res.writeHead(503, { 'content-type': 'text/plain' });

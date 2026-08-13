@@ -22,6 +22,10 @@
     "color": true,
     "refreshIntervalMs": 100
   },
+  "monitor": {
+    "enabled": true,
+    "theme": "dark-green"
+  },
   "timeouts": {
     "connectTimeoutMs": 30000
   },

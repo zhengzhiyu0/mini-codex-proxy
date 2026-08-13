@@ -180,6 +180,9 @@ function validateAndNormalizeConfig(input) {
       color: input.progress?.color !== false,
       refreshIntervalMs,
     },
+    monitor: {
+      enabled: input.monitor?.enabled !== false,
+    },
     debug: input.debug === true,
     timeouts: { connectTimeoutMs },
   };
@@ -324,6 +327,82 @@ function sendJson(response, statusCode, value) {
     'content-length': String(body.length),
   });
   response.end(body);
+}
+
+function isLoopbackAddress(address) {
+  if (typeof address !== 'string') return false;
+  return address === '::1'
+    || address.startsWith('127.')
+    || address.startsWith('::ffff:127.');
+}
+
+function serializeMonitorRequest(metrics, now = process.hrtime.bigint()) {
+  const endedAt = metrics.endedAt || now;
+  const elapsedMs = Math.round(elapsedSeconds(metrics.startedAt, endedAt) * 1000);
+  const firstByteMs = metrics.firstByteAt
+    ? Math.round(elapsedSeconds(metrics.startedAt, metrics.firstByteAt) * 1000)
+    : null;
+  const firstOutputTextMs = metrics.firstOutputTextAt
+    ? Math.round(elapsedSeconds(metrics.startedAt, metrics.firstOutputTextAt) * 1000)
+    : null;
+  let state = 'connecting';
+  if (metrics.endedAt) state = metrics.status >= 200 && metrics.status < 400 ? 'completed' : 'failed';
+  else if (metrics.firstByteAt) state = 'streaming';
+  else if (metrics.status) state = 'waiting';
+
+  return {
+    id: metrics.id,
+    method: metrics.method,
+    path: metrics.path,
+    model: metrics.originalModel || null,
+    mappedModel: metrics.mappedModel || null,
+    upstream: metrics.upstream || null,
+    status: metrics.status || null,
+    state,
+    stream: metrics.stream === true,
+    requestBytes: metrics.requestBytes,
+    responseBytes: metrics.responseBytes,
+    firstByteMs,
+    firstOutputTextMs,
+    elapsedMs,
+    completed: metrics.completed === true,
+    failed: metrics.failed === true,
+  };
+}
+
+function createMonitorState() {
+  const active = new Map();
+  const history = [];
+  let latest = null;
+  const startedAt = Date.now();
+
+  return {
+    start(metrics) {
+      active.set(metrics.id, metrics);
+    },
+    finish(metrics) {
+      active.delete(metrics.id);
+      latest = { ...metrics };
+      history.unshift(serializeMonitorRequest(latest));
+      if (history.length > 100) history.length = 100;
+    },
+    snapshot() {
+      const now = process.hrtime.bigint();
+      const activeRequests = Array.from(active.values()).map((metrics) => (
+        serializeMonitorRequest(metrics, now)
+      ));
+      return {
+        service: 'mini-codex-proxy',
+        online: true,
+        uptimeMs: Date.now() - startedAt,
+        activeCount: activeRequests.length,
+        activeRequests,
+        latest: activeRequests.at(-1)
+          || (latest ? serializeMonitorRequest(latest, now) : null),
+        history: history.map((item) => ({ ...item })),
+      };
+    },
+  };
 }
 
 function injectMappedModels(body, headers, mappings) {
@@ -500,6 +579,7 @@ function createProxyServer(rawConfig, options = {}) {
   const config = validateAndNormalizeConfig(rawConfig);
   const logOutput = options.log || defaultLog;
   const progress = createTerminalProgress(config, options.progress);
+  const monitor = createMonitorState();
   const clientSockets = new Set();
 
   function log(line) {
@@ -517,6 +597,21 @@ function createProxyServer(rawConfig, options = {}) {
     const startedAt = process.hrtime.bigint();
     const requestId = String(request.headers['x-request-id'] || crypto.randomUUID());
     const clientUrl = new URL(request.url, 'http://localhost');
+
+    if (clientUrl.pathname === '/_mini/status') {
+      if (!config.monitor.enabled || request.method !== 'GET') {
+        sendJson(response, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
+        return;
+      }
+      if (!isLoopbackAddress(request.socket.remoteAddress)) {
+        sendJson(response, 403, { error: { message: 'Local access only', type: 'forbidden' } });
+        return;
+      }
+      response.setHeader('cache-control', 'no-store');
+      sendJson(response, 200, monitor.snapshot());
+      return;
+    }
+
     const endpoint = endpointForPath(clientUrl.pathname);
 
     if (!endpoint
@@ -569,7 +664,11 @@ function createProxyServer(rawConfig, options = {}) {
       firstOutputTextAt: null,
       startedAt,
       endedAt: null,
+      stream: requestInfo.stream,
+      completed: false,
+      failed: false,
     };
+    monitor.start(progressMetrics);
     progress.start(progressMetrics);
     let logged = false;
     const finishLog = () => {
@@ -578,6 +677,8 @@ function createProxyServer(rawConfig, options = {}) {
       progressMetrics.status = finalStatus;
       progressMetrics.upstream = finalUpstreamName;
       progressMetrics.endedAt = process.hrtime.bigint();
+      progressMetrics.failed = finalStatus < 200 || finalStatus >= 400;
+      monitor.finish(progressMetrics);
       const durationSeconds = elapsedSeconds(startedAt, progressMetrics.endedAt);
       const modelPart = requestInfo.originalModel
         ? ` model=${requestInfo.originalModel}->${requestInfo.mappedModel}`
@@ -694,7 +795,8 @@ function createProxyServer(rawConfig, options = {}) {
         response.writeHead(finalStatus, upstreamResponse.statusMessage, responseHeaders);
 
         let observer;
-        if ((config.debug || progress.isInteractive) && /text\/event-stream/i.test(contentType)) {
+        if ((config.debug || progress.isInteractive || config.monitor.enabled)
+          && /text\/event-stream/i.test(contentType)) {
           observer = createSseObserver();
         }
 
@@ -705,6 +807,8 @@ function createProxyServer(rawConfig, options = {}) {
           if (observer) {
             observer.observe(chunk, observedAt);
             progressMetrics.firstOutputTextAt = observer.state.firstOutputTextAt;
+            progressMetrics.completed = observer.state.completed;
+            progressMetrics.failed = observer.state.failed;
           }
           progress.update(progressMetrics);
         });
