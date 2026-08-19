@@ -265,6 +265,9 @@ function endpointForPath(pathname) {
   if (pathname === '/v1/responses' || pathname === '/responses') {
     return { name: 'responses', canonicalPath: '/responses' };
   }
+  if (pathname === '/v1/messages' || pathname === '/messages') {
+    return { name: 'messages', canonicalPath: '/messages' };
+  }
   if (pathname === '/v1/models' || pathname === '/models') {
     return { name: 'models', canonicalPath: '/models' };
   }
@@ -346,6 +349,10 @@ function prepareRequestHeaders(clientHeaders, upstream, config, body, forceIdent
     delete headers.authorization;
   }
 
+  // Anthropic clients (Claude Code) send x-api-key with the local client key;
+  // the gateway authenticates via Bearer above, so drop it to avoid conflicts.
+  delete headers['x-api-key'];
+
   if (body !== null) {
     headers['content-length'] = String(body.length);
   }
@@ -368,8 +375,13 @@ function safeTokenEqual(actual, expected) {
 
 function isClientAuthorized(request, config) {
   if (!config.clientApiKey) return true;
-  const token = extractBearerToken(request.headers.authorization);
-  return safeTokenEqual(token, config.clientApiKey);
+  // Codex / OpenAI clients send Authorization: Bearer <key>;
+  // Claude Code / Anthropic clients send x-api-key: <key>.
+  const bearer = extractBearerToken(request.headers.authorization);
+  if (safeTokenEqual(bearer, config.clientApiKey)) return true;
+  const apiKeyHeader = request.headers['x-api-key'];
+  const apiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+  return safeTokenEqual(typeof apiKey === 'string' ? apiKey.trim() : apiKey, config.clientApiKey);
 }
 
 function prepareResponseHeaders(upstreamHeaders) {
@@ -689,6 +701,7 @@ function createProxyServer(rawConfig, options = {}) {
 
     if (!endpoint
       || (endpoint.name === 'responses' && request.method !== 'POST')
+      || (endpoint.name === 'messages' && request.method !== 'POST')
       || (endpoint.name === 'models' && request.method !== 'GET')) {
       sendJson(response, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
       return;
@@ -762,7 +775,7 @@ function createProxyServer(rawConfig, options = {}) {
         ? ` model=${requestInfo.originalModel}->${requestInfo.mappedModel}`
         : '';
       const bytePart = requestBody === null ? '' : ` bytes=${rawRequestBytes}`;
-      const streamPart = endpoint.name === 'responses' ? ` stream=${requestInfo.stream}` : '';
+      const streamPart = (endpoint.name === 'responses' || endpoint.name === 'messages') ? ` stream=${requestInfo.stream}` : '';
       if (!progress.finish(progressMetrics)) {
         log(`${formatTime()} ${request.method} ${clientUrl.pathname}${modelPart}`
           + ` upstream=${finalUpstreamName}:${finalStatus} duration=${durationSeconds.toFixed(2)}s`
@@ -803,7 +816,7 @@ function createProxyServer(rawConfig, options = {}) {
       const upstreamRequest = transport.request(upstreamUrl, {
         method: request.method,
         headers,
-        agent: endpoint.name === 'responses' ? false : undefined,
+        agent: (endpoint.name === 'responses' || endpoint.name === 'messages') ? false : undefined,
       });
 
       upstreamRequest.once('socket', (socket) => {
