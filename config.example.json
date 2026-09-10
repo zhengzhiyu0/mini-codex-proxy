@@ -1,11 +1,15 @@
 {
   "host": "127.0.0.1",
   "port": 8317,
-  "activeGroup": "naiccc",
+  "activeGroups": [
+    "openai",
+    "claude"
+  ],
   "groups": {
-    "naiccc": {
+    "openai": {
+      "priority": 100,
       "upstream": {
-        "name": "naiccc",
+        "name": "openai-gateway",
         "baseUrl": "https://example.com/v1",
         "apiKey": ""
       },
@@ -14,19 +18,45 @@
         "gpt-5.6-luna": "gpt-5.4-mini",
         "gpt-5.6-terra": "gpt-5.4"
       },
+      "endpoints": [
+        "responses",
+        "chat",
+        "models"
+      ],
       "injectMappedModels": true,
       "overrideModelList": false
     },
+    "claude": {
+      "priority": 90,
+      "upstream": {
+        "name": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "",
+        "authStyle": "x-api-key"
+      },
+      "models": {
+        "claude-sonnet": "claude-sonnet-4-6",
+        "claude-opus": "claude-opus-4-1"
+      },
+      "endpoints": [
+        "messages",
+        "models"
+      ]
+    },
     "grok": {
+      "priority": 10,
       "upstream": {
         "name": "grok",
         "baseUrl": "https://api.x.ai/v1",
         "apiKey": ""
       },
       "models": {
-        "gpt-5.6-sol": "grok-4.6"
+        "grok-fast": "grok-4.6"
       },
-      "overrideModelList": true
+      "endpoints": [
+        "chat",
+        "models"
+      ]
     }
   },
   "clientApiKey": "change-this-local-key",
@@ -42,6 +72,14 @@
   "monitor": {
     "enabled": true,
     "theme": "dark-green"
+  },
+  "requestLog": {
+    "enabled": true,
+    "limit": 500,
+    "file": "logs/requests.jsonl"
+  },
+  "webui": {
+    "enabled": true
   },
   "timeouts": {
     "connectTimeoutMs": 30000

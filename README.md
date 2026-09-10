@@ -39,29 +39,33 @@ Copy-Item .\config.example.json .\config.json -Force
 {
   "host": "127.0.0.1",
   "port": 8317,
-  "activeGroup": "naiccc",
+  "activeGroups": ["openai", "claude"],
   "groups": {
-    "naiccc": {
+    "openai": {
+      "priority": 100,
       "upstream": {
-        "name": "naiccc",
+        "name": "openai-gateway",
         "baseUrl": "https://example.com/v1",
         "apiKey": "sk-your-upstream-key"
       },
       "models": {
         "gpt-5.6-luna": "gpt-5.4-mini"
       },
+      "endpoints": ["responses", "chat", "models"],
       "injectMappedModels": true
     },
-    "grok": {
+    "claude": {
+      "priority": 90,
       "upstream": {
-        "name": "grok",
-        "baseUrl": "https://api.x.ai/v1",
-        "apiKey": "sk-your-grok-key"
+        "name": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "sk-ant-your-key",
+        "authStyle": "x-api-key"
       },
       "models": {
-        "gpt-5.6-sol": "grok-4.6"
+        "claude-sonnet": "claude-sonnet-4-6"
       },
-      "overrideModelList": true
+      "endpoints": ["messages", "models"]
     }
   },
   "clientApiKey": "your-own-local-key",
@@ -101,17 +105,24 @@ npm start
 http://127.0.0.1:8317
 ```
 
-启动日志会带上当前组名：
+启动日志会带上所有已启用的组名：
 
 ```text
-mini-codex-proxy listening on http://127.0.0.1:8317 (group=naiccc)
+mini-codex-proxy listening on http://127.0.0.1:8317 (groups=openai,claude)
 ```
 
-临时换组不必改 `config.json`：
+临时改变启用范围不必改 `config.json`：
 
 ```powershell
-$env:MINI_CODEX_PROXY_GROUP = 'grok'
+$env:MINI_CODEX_PROXY_GROUPS = 'openai,claude'
 node .\proxy.js
+```
+
+只启用一个渠道，或启用全部：
+
+```powershell
+$env:MINI_CODEX_PROXY_GROUPS = 'claude'
+$env:MINI_CODEX_PROXY_GROUPS = 'all'
 ```
 
 按 `Ctrl+C` 可正常关闭本地监听和现有连接。
@@ -182,12 +193,14 @@ naiccc 的真实 Key 只保存在 mini-codex-proxy 的 `upstream.apiKey` 中，�
 
 ## 支持的接口
 
-- `POST /v1/responses`
-- `POST /responses`
-- `GET /v1/models`
-- `GET /models`
+- `POST /v1/responses`、`POST /responses`
+- `POST /v1/messages`、`POST /messages`
+- `POST /v1/chat/completions`、`POST /chat/completions`
+- `GET /v1/models`、`GET /models`
 
-代理不会把 Responses 转换为 Chat Completions，也不提供 `/v1/chat/completions`。
+代理不做协议转换：Responses 不会被改写成 Chat Completions，Anthropic Messages 也不会被改写成 Responses。每个接口按原样转发到支持它的渠道，只替换顶层 `model`。
+
+用 `endpoints` 限定每组接受哪些接口，就能把 OpenAI 渠道和 Claude 渠道挂在同一个端口上。
 
 ## Responses 流式透传
 
@@ -213,49 +226,101 @@ body.model = configuredMapping[body.model] ?? body.model;
 
 `debug=true` 时，代理会旁路观察是否出现 `response.completed`、`response.failed` 和 `[DONE]`。观察器只读数据块，不改变也不重新生成事件。
 
-## 配置组
+## 配置组（多渠道同时启用）
 
-`groups` 用来保存多套上游和模型映射。启动时只激活一组：
+`groups` 用来保存多套上游和模型映射，可以同时启用任意多个组。生效范围按以下顺序解析：
 
-1. 环境变量 `MINI_CODEX_PROXY_GROUP`
-2. `config.json` 的 `activeGroup`
-3. `groups` 里的第一个组
+1. 环境变量 `MINI_CODEX_PROXY_GROUPS`（逗号分隔）
+2. 环境变量 `MINI_CODEX_PROXY_GROUP`（逗号分隔，兼容旧写法）
+3. `config.json` 的 `activeGroups`（数组或逗号分隔字符串）
+4. `config.json` 的 `activeGroup`（兼容旧写法）
+5. `groups` 里的第一个组
+
+把值写成 `"all"` 表示启用全部组：
+
+```json
+{
+  "activeGroups": "all"
+}
+```
 
 每一组都可以单独写：
 
 - `upstream` 或 `upstreams`
 - `models`
+- `endpoints`：这一组接受哪些接口，取值 `responses`、`messages`、`chat`、`models`；不写表示全部
+- `priority`：组之间的优先级，数值大的先尝试，默认 `0`
 - `injectMappedModels`
 - `overrideModelList`
 
-例如 Codex 界面继续显示 `gpt-5.6-sol`，实际打到 grok：
+OpenAI 和 Claude 渠道混合启用：
 
 ```json
 {
-  "activeGroup": "grok",
+  "activeGroups": ["openai", "claude"],
   "groups": {
-    "grok": {
+    "openai": {
+      "priority": 100,
       "upstream": {
-        "name": "grok",
-        "baseUrl": "https://api.x.ai/v1",
-        "apiKey": "sk-your-grok-key"
+        "name": "openai-gateway",
+        "baseUrl": "https://example.com/v1",
+        "apiKey": "sk-your-openai-key"
       },
       "models": {
-        "gpt-5.6-sol": "grok-4.6"
+        "gpt-5.6-sol": "gpt-5.4"
       },
-      "overrideModelList": true
+      "endpoints": ["responses", "chat", "models"]
+    },
+    "claude": {
+      "priority": 90,
+      "upstream": {
+        "name": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "sk-ant-your-key",
+        "authStyle": "x-api-key"
+      },
+      "models": {
+        "claude-sonnet": "claude-sonnet-4-6"
+      },
+      "endpoints": ["messages", "models"]
     }
   }
 }
 ```
 
+这样一个代理端口同时对外提供两家模型：请求 `gpt-5.6-sol` 走 OpenAI 渠道，请求 `claude-sonnet` 走 Claude 渠道，互不影响。
+
 不写 `groups` 时，顶层 `upstream` / `upstreams` / `models` 仍可直接使用，会自动收成名为 `default` 的一组。
+
+### 请求如何选择渠道
+
+按顺序判断：
+
+1. 模型名写成 `组名/模型别名`（例如 `claude/claude-sonnet`）时，只使用这一组，忽略优先级。
+2. 模型别名只属于某一组时，使用那一组。
+3. 同一个别名被多组配置时，按 `priority` 从高到低排列，先用优先级最高的那组，失败才顺延。
+4. 模型名不在任何 `models` 里时，按 `priority` 顺序尝试所有支持该接口的组，模型名原样转发。
+
+只有支持当前接口（`endpoints`）的组才会参与。如果没有任何组支持这个接口或这个模型，代理返回 `404`，不会去连上游。
+
+每组保留自己的映射：同一个别名 `shared` 在 A 组映射成 `a-model`、在 B 组映射成 `b-model` 时，切换到 B 组重试会改写成 `b-model`，不会把 A 组的目标名带过去。
+
+### 上游认证方式
+
+`authStyle` 决定代理用哪个请求头向上游认证：
+
+- `bearer`（默认）：`Authorization: Bearer <apiKey>`
+- `x-api-key`：`x-api-key: <apiKey>`，Anthropic 官方接口需要这一种
+
+客户端自己带的 `Authorization` 和 `x-api-key` 一律不会转发给上游。
 
 ## 模型列表
 
-`GET /v1/models` 默认转发到当前组的上游。`injectMappedModels=true` 时，代理只对这个模型列表接口缓冲并解析成功的 JSON 响应，然后把当前组 `models` 中的 alias 追加到 `data` 数组。
+`GET /v1/models` 返回所有启用渠道的 alias 合集。同一个别名被多组配置时，除了公共别名，还会额外列出 `组名/别名` 形式，方便指定具体渠道。
 
-如果只想让 Codex 看到你自己的模型名，把当前组的 `overrideModelList` 设为 `true`。此时 `/v1/models` 不再访问上游，只返回该组 `models` 的左侧 alias。`overrideModelList=true` 时会忽略 `injectMappedModels`。
+只启用一个渠道时保留原有行为：默认转发到该组上游，`injectMappedModels=true` 会把该组的 alias 追加进上游返回的 `data` 数组，`overrideModelList=true` 则只返回本地 alias 且不访问上游。
+
+同时启用多个渠道时，没有任何单一上游的列表能代表代理实际提供的模型，因此固定返回本地合集，不再转发到某一个上游。
 
 Responses 接口不受该逻辑影响，永远不会为模型注入而缓冲。
 
@@ -266,15 +331,16 @@ Responses 接口不受该逻辑影响，永远不会为模型注入而缓冲。
 在独立终端运行代理时，会显示一条实时刷新的彩色状态行：
 
 ```text
-⠹ | #a81f90c2 | POST | /v1/responses | gpt-5.6-luna→gpt-5.4-mini | naiccc | 200 | ↑ 18.2 KB | ↓ 46.8 KB | 首包 0.42s | 首字 1.73s | 已用 6.21s
+⠹ | #a81f90c2 | POST | /v1/responses | gpt-5.6-luna→gpt-5.4-mini | naiccc/naiccc | 200 | ↑ 18.2 KB | ↓ 46.8 KB | 首包 0.42s | 首字 1.73s | 已用 6.21s
 ```
 
 请求完成后，状态行会固定为汇总：
 
 ```text
-✓ | #a81f90c2 | POST | /v1/responses | gpt-5.6-luna→gpt-5.4-mini | naiccc | 200 | ↑ 18.2 KB | ↓ 83.4 KB | 首包 0.42s | 首字 1.73s | 总耗时 8.31s
+✓ | #a81f90c2 | POST | /v1/responses | gpt-5.6-luna→gpt-5.4-mini | naiccc/naiccc | 200 | ↑ 18.2 KB | ↓ 83.4 KB | 首包 0.42s | 首字 1.73s | 总耗时 8.31s
 ```
 
+- 组名与上游名不同时显示为 `组名/上游名`，相同时只显示一个。
 - `↑`：客户端请求体的原始字节数。
 - `↓`：从上游收到并转发的响应字节数。
 - `首包`：从请求进入代理到收到首个上游响应数据块。
@@ -300,10 +366,10 @@ Responses 接口不受该逻辑影响，永远不会为模型注入而缓冲。
 示例：
 
 ```text
-2026-08-12 15:20:01 POST /v1/responses model=gpt-5.6-sol->gpt-5.4 upstream=naiccc:200 duration=8.31s bytes=12450 stream=true
+2026-08-12 15:20:01 POST /v1/responses model=gpt-5.6-sol->gpt-5.4 group=naiccc upstream=naiccc:200 duration=8.31s bytes=12450 stream=true tokens=12480/842 cache=76.9%
 ```
 
-日志只包含方法、路径、模型映射、上游名与状态、耗时、请求体字节数和 `stream` 标志。
+日志包含方法、路径、模型映射、组名、上游名与状态、耗时、请求体字节数、`stream` 标志，以及 token 数与缓存命中率（上游返回 usage 时才有）。
 
 日志不会包含：
 
@@ -311,6 +377,86 @@ Responses 接口不受该逻辑影响，永远不会为模型注入而缓冲。
 - prompt、`input`、`instructions`
 - `tools` 内容
 - SSE 正文
+
+## 请求日志与缓存命中
+
+每个请求的 usage 会同时写入内存和磁盘。进程重启后，WebUI 会从磁盘把最近记录读回来，缓存命中统计也会接着算。
+
+默认配置：
+
+```json
+{
+  "requestLog": {
+    "enabled": true,
+    "limit": 500,
+    "file": "logs/requests.jsonl"
+  }
+}
+```
+
+- `limit`：内存与 WebUI 中保留的最近请求条数，超出后丢弃最旧的，默认 `500`
+- `file`：JSON Lines 落盘路径，相对项目根目录。默认 `logs/requests.jsonl`。启动时只从文件尾部读取最近 `limit` 条，不会把整份历史一次性读进内存。设为 `null` 则只保留在内存，进程退出即丢失
+
+文件按追加写入，每行一条，崩溃时最多丢掉最后半行。序号 `seq` 从文件里已有的最大值继续往下编。设置 `"requestLog": { "enabled": false }` 可同时关闭内存记录和落盘。
+
+### 缓存命中率怎么算
+
+两家上游的 usage 字段语义不同，代理统一折算后再计算，因此不同渠道的命中率可以直接比较：
+
+| 上游 | 字段 | 处理方式 |
+|---|---|---|
+| Anthropic | `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` | 三者相加得到输入总量 |
+| OpenAI | `prompt_tokens`（已含缓存） + `prompt_tokens_details.cached_tokens` | 直接用 `prompt_tokens`，不重复累加 |
+
+命中率 = `cacheReadTokens / promptTokens`。上游没返回 usage 时为 `null`，不参与统计。
+
+Anthropic 的 usage 分散在 `message_start`（输入与缓存）和 `message_delta`（输出）两个事件里，代理会合并这两处，所以流式请求也有完整数据。
+
+### 查询接口
+
+```text
+GET http://127.0.0.1:8317/_mini/requests
+GET http://127.0.0.1:8317/_mini/stats
+```
+
+`/_mini/requests` 支持以下查询参数：
+
+| 参数 | 取值 | 含义 |
+|---|---|---|
+| `limit` | 1-1000，默认 100 | 返回条数 |
+| `group` | 组名 | 只看某个渠道 |
+| `model` | 模型名 | 匹配原始名或映射后的名字 |
+| `status` | `ok` / `failed` | 只看成功或失败 |
+| `cached` | `hit` / `miss` | 只看缓存命中或未命中 |
+
+例如只看 claude 渠道的缓存命中请求：
+
+```text
+GET /_mini/requests?group=claude&cached=hit
+```
+
+`/_mini/stats` 返回总计以及按渠道、按模型的分组统计。
+
+这两个接口和 `/_mini/status` 一样只允许 loopback 访问，也同样不返回 API Key、prompt、`input`、tools 或 SSE 正文——只有 token 计数。设置 `"requestLog": { "enabled": false }` 可关闭记录。
+
+## WebUI 面板
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8317/_mini
+```
+
+单文件内嵌页面，无需构建步骤、npm 依赖或额外端口。每 2 秒自动刷新，页面切到后台时暂停轮询。
+
+面板包含：
+
+- 顶部卡片：总请求数、缓存命中率（带进度条）、缓存读取/输入/输出 token、进行中请求数
+- 活动请求表：进行中请求的实时状态、已用时间、首包耗时、下行字节
+- 渠道统计表：可切换按渠道或按模型聚合
+- 请求日志表：可按缓存命中/未命中、成功/失败筛选；`尝试` 列大于 1 表示发生过故障切换
+
+设置 `"webui": { "enabled": false }` 可关闭面板，此时 `/_mini/requests` 与 `/_mini/stats` 仍然可用。
 
 ## Windows 置顶悬浮窗
 
@@ -393,9 +539,11 @@ GET http://127.0.0.1:8317/_mini/status
 
 悬浮窗和代理建议分别运行在两个终端；关闭悬浮窗不会中断 Codex 请求，也不会改变 Responses SSE 透传。
 
-## 可选故障切换
+## 故障切换
 
-第一版已经支持简单的优先级故障切换。把单个 `upstream` 改为：
+两级切换，都发生在代理还没向客户端发送响应头和 body 之前；SSE 一旦开始发送，绝不会中途切换。只有连接失败或上游返回 `502`、`503`、`520`、`524` 时才尝试下一项。
+
+组内多上游，按 `upstreams[].priority` 从高到低：
 
 ```json
 {
@@ -420,7 +568,9 @@ GET http://127.0.0.1:8317/_mini/status
 }
 ```
 
-只有连接失败或上游返回 `502`、`503`、`520`、`524` 时才尝试下一项。切换发生在代理尚未向客户端发送响应头和响应 body 之前；SSE 一旦开始发送，绝不会中途切换。
+跨组切换：同一个模型别名被多个启用中的组配置时，按组的 `priority` 从高到低顺延。换组重试会改用新组自己的模型映射和自己的 `apiKey`、`authStyle`。
+
+用 `组名/别名` 指定渠道时不参与跨组切换，只在该组内部的 `upstreams` 之间切换。
 
 ## 安全说明
 
@@ -443,11 +593,15 @@ Copy-Item .\config.example.json .\config.json
 
 ### `Missing upstream.baseUrl`
 
-检查当前组的 `upstream.baseUrl` 是否存在，或使用非空的 `upstreams` 数组。
+检查对应组的 `upstream.baseUrl` 是否存在，或使用非空的 `upstreams` 数组。
 
-### `Unknown activeGroup`
+### `Unknown active group`
 
-`activeGroup` 或环境变量 `MINI_CODEX_PROXY_GROUP` 必须对应 `groups` 里已有的组名。
+`activeGroups`、`activeGroup` 或环境变量 `MINI_CODEX_PROXY_GROUPS` 必须对应 `groups` 里已有的组名。用 `"all"` 表示全部。
+
+### 返回 404 且提示 `No active channel serves ...`
+
+没有任何启用中的组支持这个接口或这个模型。检查该组是否在 `activeGroups` 里、`endpoints` 是否包含当前接口、`models` 是否有这个 alias。
 
 ### `Invalid port`
 
@@ -479,4 +633,4 @@ Copy-Item .\config.example.json .\config.json
 npm test
 ```
 
-测试会启动本地模拟上游，不需要真实 API Key，也不会访问真实模型服务。覆盖模型映射、字段保留、统一 Key 验证、上游 Authorization、非流式响应、分块 SSE、reasoning/tool/completed 事件、错误透传、模型注入、故障切换、日志脱敏、502 和正常关闭。
+测试会启动本地模拟上游，不需要真实 API Key，也不会访问真实模型服务。覆盖模型映射、字段保留、统一 Key 验证、上游 Authorization、非流式响应、分块 SSE、reasoning/tool/completed 事件、错误透传、模型注入、多渠道同时启用、按接口路由、跨组切换、`组名/别名` 定向、故障切换、两种 usage 字段折算、流式 usage 合并、缓存命中筛选与分组统计、WebUI 面板与 loopback 限制、JSON Lines 落盘与重启后回读、日志脱敏、502 和正常关闭。

@@ -8,7 +8,17 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const test = require('node:test');
 const { once } = require('node:events');
-const { createProxyServer } = require('../proxy');
+const proxy = require('../proxy');
+const { normalizeUsage, cacheHitRate, validateAndNormalizeConfig } = proxy;
+
+function createProxyServer(rawConfig, options) {
+  // Tests must not share the process-wide default jsonl; opt in with requestLog.file.
+  const requestLog = rawConfig.requestLog || {};
+  const config = requestLog.file
+    ? rawConfig
+    : { ...rawConfig, requestLog: { file: null, ...requestLog } };
+  return proxy.createProxyServer(config, options);
+}
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -53,11 +63,53 @@ function makeConfig(upstreamPort, overrides = {}) {
     injectMappedModels: true,
     overrideModelList: false,
     logging: { enabled: true },
+    requestLog: { file: null },
     timeouts: { connectTimeoutMs: 1000 },
-    debug: false,
     ...overrides,
   };
 }
+
+test('chat completions requests are forwarded to the upstream /chat/completions path with model mapping', async (t) => {
+  let received;
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = {
+      url: req.url,
+      authorization: req.headers.authorization,
+      body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+    };
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"chatcmpl_1","object":"chat.completion"}');
+  });
+  const upstreamPort = await listen(upstream);
+  const logs = [];
+  const proxy = createProxyServer(makeConfig(upstreamPort), { log: (line) => logs.push(line) });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  const input = {
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    stream: false,
+  };
+  const result = await request({
+    port: proxyPort,
+    path: '/v1/chat/completions',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer client-secret-key',
+    },
+    body: JSON.stringify(input),
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.toString(), '{"id":"chatcmpl_1","object":"chat.completion"}');
+  assert.equal(received.url, '/v1/chat/completions');
+  assert.equal(received.authorization, 'Bearer server-secret-key');
+  assert.deepEqual(received.body, { ...input, model: 'gpt-5.4' });
+  assert.ok(logs.some((line) => line.includes('gpt-5.6-sol->gpt-5.4')));
+});
 
 test('non-streaming request only changes model and uses configured authorization', async (t) => {
   let received;
@@ -457,6 +509,243 @@ test('activeGroup selects that group upstreams and model mapping', async (t) => 
   assert.deepEqual(snapshot.groups, ['naiccc', 'grok']);
 });
 
+test('several groups stay active at once and each alias reaches its own channel', async (t) => {
+  const calls = [];
+  const openai = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    calls.push({
+      channel: 'openai',
+      url: req.url,
+      authorization: req.headers.authorization,
+      apiKeyHeader: req.headers['x-api-key'],
+      model: JSON.parse(Buffer.concat(chunks).toString('utf8')).model,
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"resp_openai"}');
+  });
+  const anthropic = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    calls.push({
+      channel: 'anthropic',
+      url: req.url,
+      authorization: req.headers.authorization,
+      apiKeyHeader: req.headers['x-api-key'],
+      model: JSON.parse(Buffer.concat(chunks).toString('utf8')).model,
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"msg_claude"}');
+  });
+  const openaiPort = await listen(openai);
+  const anthropicPort = await listen(anthropic);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    activeGroups: ['openai', 'claude'],
+    groups: {
+      openai: {
+        upstream: { name: 'oai', baseUrl: `http://127.0.0.1:${openaiPort}/v1`, apiKey: 'oai-key' },
+        models: { 'gpt-5.6-sol': 'gpt-5.4' },
+        endpoints: ['responses', 'chat', 'models'],
+      },
+      claude: {
+        upstream: {
+          name: 'anthropic',
+          baseUrl: `http://127.0.0.1:${anthropicPort}`,
+          apiKey: 'claude-key',
+          authStyle: 'x-api-key',
+        },
+        models: { 'claude-sonnet': 'claude-sonnet-4-6' },
+        endpoints: ['messages', 'models'],
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(openai); await close(anthropic); });
+
+  const viaOpenai = await request({
+    port: proxyPort,
+    path: '/v1/responses',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+  assert.equal(viaOpenai.statusCode, 200);
+  assert.equal(viaOpenai.body.toString(), '{"id":"resp_openai"}');
+  assert.deepEqual(calls.at(-1), {
+    channel: 'openai',
+    url: '/v1/responses',
+    authorization: 'Bearer oai-key',
+    apiKeyHeader: undefined,
+    model: 'gpt-5.4',
+  });
+
+  const viaClaude = await request({
+    port: proxyPort,
+    path: '/v1/messages',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-sonnet', messages: [] }),
+  });
+  assert.equal(viaClaude.statusCode, 200);
+  assert.equal(viaClaude.body.toString(), '{"id":"msg_claude"}');
+  assert.deepEqual(calls.at(-1), {
+    channel: 'anthropic',
+    url: '/messages',
+    authorization: undefined,
+    apiKeyHeader: 'claude-key',
+    model: 'claude-sonnet-4-6',
+  });
+
+  const models = await request({ port: proxyPort, path: '/v1/models', method: 'GET' });
+  assert.deepEqual(
+    JSON.parse(models.body.toString('utf8')).data.map((model) => model.id),
+    ['gpt-5.6-sol', 'claude-sonnet'],
+  );
+
+  const status = await request({ port: proxyPort, path: '/_mini/status', method: 'GET' });
+  const snapshot = JSON.parse(status.body.toString('utf8'));
+  assert.deepEqual(snapshot.activeGroups, ['openai', 'claude']);
+  assert.equal(snapshot.latest.group, 'claude');
+});
+
+test('a request for an endpoint no active channel serves is rejected', async (t) => {
+  const openai = http.createServer(() => {
+    throw new Error('a channel without the messages endpoint must not be contacted');
+  });
+  const openaiPort = await listen(openai);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      openai: {
+        upstream: { name: 'oai', baseUrl: `http://127.0.0.1:${openaiPort}/v1`, apiKey: 'oai-key' },
+        models: { 'gpt-5.6-sol': 'gpt-5.4' },
+        endpoints: ['responses'],
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(openai); });
+
+  const result = await request({
+    port: proxyPort,
+    path: '/v1/messages',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', messages: [] }),
+  });
+  assert.equal(result.statusCode, 404);
+  assert.equal(JSON.parse(result.body.toString('utf8')).error.type, 'invalid_request_error');
+});
+
+test('an ambiguous alias prefers priority order and fails over across groups', async (t) => {
+  const models = [];
+  const down = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    models.push(JSON.parse(Buffer.concat(chunks).toString('utf8')).model);
+    res.writeHead(503, { 'content-type': 'text/plain' });
+    res.end('down');
+  });
+  const up = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    models.push(JSON.parse(Buffer.concat(chunks).toString('utf8')).model);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"resp_backup"}');
+  });
+  const downPort = await listen(down);
+  const upPort = await listen(up);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    activeGroups: 'all',
+    groups: {
+      backup: {
+        priority: 1,
+        upstream: { name: 'backup', baseUrl: `http://127.0.0.1:${upPort}/v1`, apiKey: '' },
+        models: { 'gpt-5.6-sol': 'backup-model' },
+        endpoints: ['responses'],
+      },
+      primary: {
+        priority: 100,
+        upstream: { name: 'primary', baseUrl: `http://127.0.0.1:${downPort}/v1`, apiKey: '' },
+        models: { 'gpt-5.6-sol': 'primary-model' },
+        endpoints: ['responses'],
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(down); await close(up); });
+
+  const result = await request({
+    port: proxyPort,
+    path: '/v1/responses',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.toString(), '{"id":"resp_backup"}');
+  // Each channel receives the model name its own mapping defines, not the first channel's.
+  assert.deepEqual(models, ['primary-model', 'backup-model']);
+});
+
+test('a group-qualified model name pins the request to that channel', async (t) => {
+  let received;
+  const preferred = http.createServer(() => {
+    throw new Error('the qualified group must win over priority order');
+  });
+  const pinned = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"resp_pinned"}');
+  });
+  const preferredPort = await listen(preferred);
+  const pinnedPort = await listen(pinned);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    activeGroups: 'all',
+    groups: {
+      first: {
+        priority: 100,
+        upstream: { name: 'first', baseUrl: `http://127.0.0.1:${preferredPort}/v1`, apiKey: '' },
+        models: { shared: 'first-model' },
+        endpoints: ['responses', 'models'],
+      },
+      second: {
+        priority: 1,
+        upstream: { name: 'second', baseUrl: `http://127.0.0.1:${pinnedPort}/v1`, apiKey: '' },
+        models: { shared: 'second-model' },
+        endpoints: ['responses', 'models'],
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(preferred); await close(pinned); });
+
+  const result = await request({
+    port: proxyPort,
+    path: '/v1/responses',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'second/shared', input: 'hi' }),
+  });
+  assert.equal(result.statusCode, 200);
+  assert.equal(received.model, 'second-model');
+
+  // An alias served by more than one channel is also advertised in its qualified form.
+  const models = await request({ port: proxyPort, path: '/v1/models', method: 'GET' });
+  assert.deepEqual(
+    JSON.parse(models.body.toString('utf8')).data.map((model) => model.id),
+    ['shared', 'first/shared', 'second/shared'],
+  );
+});
+
 test('failover happens before downstream headers/body are sent', async (t) => {
   const first = http.createServer((req, res) => {
     res.writeHead(503, { 'content-type': 'text/plain' });
@@ -520,6 +809,7 @@ test('standalone process handles the Ctrl+C/SIGINT shutdown path cleanly', async
     port,
     upstream: { baseUrl: 'http://127.0.0.1:9/v1', apiKey: '' },
     logging: { enabled: false },
+    requestLog: { file: null },
   }));
 
   const proxyPath = path.join(__dirname, '..', 'proxy.js');
@@ -553,4 +843,264 @@ test('standalone process handles the Ctrl+C/SIGINT shutdown path cleanly', async
   fs.rmSync(tempDirectory, { recursive: true, force: true });
   assert.equal(code, 0, `expected exit code 0, got code=${code} signal=${signal}: ${stdout} ${stderr}`);
   assert.match(stdout, /Received SIGINT, shutting down\./);
+});
+
+test('cached tokens are folded into the prompt total for both upstream usage shapes', () => {
+  // Anthropic reports cache reads alongside input_tokens, so the prompt total is the sum.
+  assert.deepEqual(
+    normalizeUsage({
+      input_tokens: 120,
+      cache_read_input_tokens: 880,
+      cache_creation_input_tokens: 40,
+      output_tokens: 64,
+    }),
+    { promptTokens: 1040, outputTokens: 64, cacheReadTokens: 880, cacheWriteTokens: 40 },
+  );
+
+  // OpenAI already counts cached tokens inside prompt_tokens, so it must not be added twice.
+  assert.deepEqual(
+    normalizeUsage({
+      prompt_tokens: 1000,
+      completion_tokens: 50,
+      prompt_tokens_details: { cached_tokens: 750 },
+    }),
+    { promptTokens: 1000, outputTokens: 50, cacheReadTokens: 750, cacheWriteTokens: 0 },
+  );
+
+  assert.equal(cacheHitRate({ promptTokens: 1000, cacheReadTokens: 750 }), 0.75);
+  // A request that reported no prompt tokens has no meaningful ratio.
+  assert.equal(cacheHitRate({ promptTokens: 0, cacheReadTokens: 0 }), null);
+  assert.equal(normalizeUsage({ prompt_tokens: 0, completion_tokens: 0 }), null);
+});
+
+test('usage split across Anthropic stream events is merged into one record', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // Prompt and cache totals arrive first; output tokens only in the closing delta.
+    res.write('event: message_start\n');
+    res.write('data: {"type":"message_start","message":{"usage":{"input_tokens":10,'
+      + '"cache_read_input_tokens":990,"output_tokens":0}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":25}}\n\n');
+    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      claude: {
+        upstream: { name: 'anthropic', baseUrl: `http://127.0.0.1:${upstreamPort}`, apiKey: 'k' },
+        models: { 'claude-sonnet': 'claude-sonnet-4-6' },
+        endpoints: ['messages'],
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  await request({
+    port: proxyPort,
+    path: '/v1/messages',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-sonnet', messages: [], stream: true }),
+  });
+
+  const logged = await request({ port: proxyPort, path: '/_mini/requests', method: 'GET' });
+  const { entries, totals } = JSON.parse(logged.body.toString('utf8'));
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].usage, {
+    promptTokens: 1000,
+    outputTokens: 25,
+    cacheReadTokens: 990,
+    cacheWriteTokens: 0,
+  });
+  assert.equal(entries[0].cacheHitRate, 0.99);
+  assert.equal(totals.cacheReadTokens, 990);
+});
+
+test('the request log separates cache hits from misses and reports per-group totals', async (t) => {
+  const warm = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      usage: { prompt_tokens: 400, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 300 } },
+    }));
+  });
+  const cold = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ usage: { prompt_tokens: 200, completion_tokens: 10 } }));
+  });
+  const warmPort = await listen(warm);
+  const coldPort = await listen(cold);
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    activeGroups: 'all',
+    groups: {
+      warm: {
+        upstream: { name: 'warm', baseUrl: `http://127.0.0.1:${warmPort}/v1`, apiKey: 'k' },
+        models: { 'gpt-warm': 'gpt-5.4' },
+        endpoints: ['responses'],
+      },
+      cold: {
+        upstream: { name: 'cold', baseUrl: `http://127.0.0.1:${coldPort}/v1`, apiKey: 'k' },
+        models: { 'gpt-cold': 'gpt-5.4-mini' },
+        endpoints: ['responses'],
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(warm); await close(cold); });
+
+  const json = { 'content-type': 'application/json' };
+  await request({ port: proxyPort, headers: json, body: JSON.stringify({ model: 'gpt-warm', input: 'hi' }) });
+  await request({ port: proxyPort, headers: json, body: JSON.stringify({ model: 'gpt-cold', input: 'hi' }) });
+
+  const hits = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/requests?cached=hit', method: 'GET',
+  })).body.toString('utf8'));
+  assert.deepEqual(hits.entries.map((entry) => entry.group), ['warm']);
+
+  const misses = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/requests?cached=miss', method: 'GET',
+  })).body.toString('utf8'));
+  assert.deepEqual(misses.entries.map((entry) => entry.group), ['cold']);
+
+  const stats = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/stats', method: 'GET',
+  })).body.toString('utf8'));
+  assert.equal(stats.overall.requests, 2);
+  // 300 cached of 600 total prompt tokens across both channels.
+  assert.equal(stats.overall.cacheHitRate, 0.5);
+  assert.equal(stats.byGroup.warm.cacheHitRate, 0.75);
+  assert.equal(stats.byGroup.cold.cacheHitRate, 0);
+  assert.equal(stats.byModel['gpt-warm'].requests, 1);
+});
+
+test('the dashboard is served on loopback and rejects remote callers', async (t) => {
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      solo: {
+        upstream: { name: 'solo', baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'k' },
+        models: { m: 'm2' },
+      },
+    },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); });
+
+  const page = await request({ port: proxyPort, path: '/_mini', method: 'GET' });
+  assert.equal(page.statusCode, 200);
+  assert.match(page.headers['content-type'], /text\/html/);
+  assert.match(page.body.toString('utf8'), /mini-codex-proxy/);
+
+  // The dashboard must never be cached; it renders live counters.
+  assert.equal(page.headers['cache-control'], 'no-store');
+
+  const unknown = await request({ port: proxyPort, path: '/_mini/nope', method: 'GET' });
+  assert.equal(unknown.statusCode, 404);
+
+  // Writes to the local surface are not an API; only GET is meaningful.
+  const posted = await request({ port: proxyPort, path: '/_mini/stats', method: 'POST', body: '{}' });
+  assert.equal(posted.statusCode, 404);
+});
+
+test('a request log file keeps one JSON record per line', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ usage: { prompt_tokens: 90, completion_tokens: 8 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mini-codex-log-'));
+  const file = path.join(directory, 'requests.jsonl');
+  const proxy = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      solo: {
+        upstream: { name: 'solo', baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: 'k' },
+        models: { 'gpt-x': 'gpt-5.4' },
+        endpoints: ['responses'],
+      },
+    },
+    requestLog: { enabled: true, file },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+  t.after(async () => {
+    await close(proxy);
+    await close(upstream);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  for (let index = 0; index < 3; index += 1) {
+    await request({
+      port: proxyPort,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-x', input: 'hi' }),
+    });
+  }
+
+  await new Promise((resolve) => proxy.gracefulShutdown(resolve));
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n');
+  assert.equal(lines.length, 3);
+  const parsed = lines.map((line) => JSON.parse(line));
+  assert.deepEqual(parsed.map((entry) => entry.seq), [1, 2, 3]);
+  assert.equal(parsed[0].usage.promptTokens, 90);
+  assert.equal(parsed[0].group, 'solo');
+
+  // A new process must surface the same records in the dashboard, and seq must continue.
+  const restarted = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      solo: {
+        upstream: { name: 'solo', baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: 'k' },
+        models: { 'gpt-x': 'gpt-5.4' },
+        endpoints: ['responses'],
+      },
+    },
+    requestLog: { enabled: true, file },
+    logging: { enabled: false },
+  });
+  const restartedPort = await listen(restarted);
+  t.after(async () => { await close(restarted); });
+
+  const restored = JSON.parse((await request({
+    port: restartedPort, path: '/_mini/requests', method: 'GET',
+  })).body.toString('utf8'));
+  assert.equal(restored.total, 3);
+  assert.deepEqual(restored.entries.map((entry) => entry.seq), [3, 2, 1]);
+  assert.equal(restored.entries[0].usage.promptTokens, 90);
+
+  await request({
+    port: restartedPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-x', input: 'hi' }),
+  });
+  await new Promise((resolve) => restarted.gracefulShutdown(resolve));
+  const after = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(after.length, 4);
+  assert.equal(after[3].seq, 4);
+});
+
+test('request logging persists to logs/requests.jsonl unless file is set to null', () => {
+  const base = {
+    host: '127.0.0.1',
+    port: 8317,
+    upstream: { baseUrl: 'http://127.0.0.1:9/v1', apiKey: '' },
+  };
+  const defaults = validateAndNormalizeConfig(base);
+  assert.equal(defaults.requestLog.file, path.resolve(__dirname, '..', 'logs', 'requests.jsonl'));
+
+  const off = validateAndNormalizeConfig({ ...base, requestLog: { enabled: false } });
+  assert.equal(off.requestLog.file, null);
+
+  const memoryOnly = validateAndNormalizeConfig({ ...base, requestLog: { file: null } });
+  assert.equal(memoryOnly.requestLog.file, null);
 });

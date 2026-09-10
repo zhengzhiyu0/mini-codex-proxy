@@ -521,7 +521,10 @@ function Update-View($snapshot) {
     $metricTotalText.Text   = Format-Ms $req.elapsedMs
     $requestText.Text       = "#$($req.id)  $($req.method) $($req.path)  HTTP $($req.status ?? '--')"
     $modelText.Text         = "模型：$model"
-    $upstreamText.Text      = "上游：$($req.upstream ?? '--')"
+    $channel = if ($req.group -and $req.upstream -and $req.group -ne $req.upstream) {
+      "$($req.group)/$($req.upstream)"
+    } elseif ($req.upstream) { $req.upstream } else { '--' }
+    $upstreamText.Text      = "上游：$channel"
     $requestBytesText.Text  = "↑ $(Format-Bytes $req.requestBytes)"
     $responseBytesText.Text = "↓ $(Format-Bytes $req.responseBytes)"
     $firstByteText.Text     = Format-Ms $req.firstByteMs
