@@ -172,6 +172,28 @@ Authorization: Bearer your-own-local-key
 
 设置 `clientApiKey` 后，建议保持 `forwardClientAuthorization=false`。只有不设置 `clientApiKey` 时，`forwardClientAuthorization=true` 才会直接把客户端 Authorization 透传给上游。
 
+### 对外提供多个 Key
+
+想给不同客户端（笔记本、手机、CI）分发不同的 key 时，用 `clientApiKeys` 代替 `clientApiKey`：
+
+```json
+{
+  "clientApiKeys": [
+    { "name": "laptop", "key": "sk-laptop-xxxx", "enabled": true, "note": "本机 Codex" },
+    { "name": "phone", "key": "sk-phone-xxxx", "enabled": true },
+    { "name": "ci", "key": "sk-ci-xxxx", "enabled": false, "note": "暂时停用" }
+  ]
+}
+```
+
+任意一个 `enabled` 的 key 都能通过校验，权限完全相同；`enabled: false` 的 key 立即失效并返回
+`401`。`name` 会写进请求日志，因此可以按 key 查看用量、筛选日志（`?apiKey=laptop`），
+在面板上也能按 key 聚合统计。这些 key 都不会转发给上游。
+
+数组为空或不配置时，代理不校验来访身份。旧的 `clientApiKey` 单字符串写法仍然有效，
+会被当作一个名为 `default` 的 key；两者同时存在时以 `clientApiKeys` 为准。
+面板的「API Key」标签页可以直接增删改这个列表。
+
 客户端请求 `gpt-5.6-luna` 时，上游实际收到：
 
 ```text
@@ -426,16 +448,30 @@ GET http://127.0.0.1:8317/_mini/stats
 | `limit` | 1-1000，默认 100 | 返回条数 |
 | `group` | 组名 | 只看某个渠道 |
 | `model` | 模型名 | 匹配原始名或映射后的名字 |
+| `apiKey` | key 名称 | 只看某个对外 API Key 发起的请求 |
 | `status` | `ok` / `failed` | 只看成功或失败 |
 | `cached` | `hit` / `miss` | 只看缓存命中或未命中 |
+| `range` | `today` / `7d` / `30d` | 时间预设：当日 / 近 7 天 / 近 30 天 |
+| `since` | ISO 时间戳 | 起始时间，优先于 `range` |
+| `until` | ISO 时间戳 | 结束时间，优先于 `range` |
 
-例如只看 claude 渠道的缓存命中请求：
+以上条件是「与」关系，可任意组合。例如只看 claude 渠道里由 `laptop` 这个 key 发起、近 7 天内失败的请求：
 
 ```text
-GET /_mini/requests?group=claude&cached=hit
+GET /_mini/requests?group=claude&apiKey=laptop&status=failed&range=7d
 ```
 
-`/_mini/stats` 返回总计以及按渠道、按模型的分组统计。
+`since` / `until` 可指定任意时间段：
+
+```text
+GET /_mini/requests?since=2026-03-01T00:00:00Z&until=2026-03-07T23:59:59Z
+```
+
+内存中只保留最近 `requestLog.limit` 条。当时间范围超出这部分时，会从 `requestLog.file`
+对应的 jsonl 末尾倒序补齐（单次读取有上限，不会把整个文件读进内存）；把 `file` 设为
+`null` 时，长时间范围只能查到内存里的记录。
+
+`/_mini/stats` 返回总计以及按渠道（`byGroup`）、按模型（`byModel`）、按对外 key（`byApiKey`）的分组统计，并接受与上表相同的筛选参数。
 
 这两个接口和 `/_mini/status` 一样只允许 loopback 访问，也同样不返回 API Key、prompt、`input`、tools 或 SSE 正文——只有 token 计数。设置 `"requestLog": { "enabled": false }` 可关闭记录。
 
@@ -449,14 +485,58 @@ http://127.0.0.1:8317/_mini
 
 单文件内嵌页面，无需构建步骤、npm 依赖或额外端口。每 2 秒自动刷新，页面切到后台时暂停轮询。
 
-面板包含：
+面板分三个标签页。
+
+### 监控
 
 - 顶部卡片：总请求数、缓存命中率（带进度条）、缓存读取/输入/输出 token、进行中请求数
-- 活动请求表：进行中请求的实时状态、已用时间、首包耗时、下行字节
-- 渠道统计表：可切换按渠道或按模型聚合
-- 请求日志表：可按缓存命中/未命中、成功/失败筛选；`尝试` 列大于 1 表示发生过故障切换
+- 筛选栏：时间（当日 / 7 天 / 一个月 / 全部 / 自定义起止日期）、渠道、模型、对外 Key、
+  成功失败、缓存命中——各条件可任意组合，卡片与下方表格都会跟着变
+- 活动请求表：进行中请求的实时状态、所用 key、已用时间、首包耗时、下行字节
+- 用量统计表：可切换按渠道 / 按模型 / 按对外 Key 聚合
+- 请求日志表：`尝试` 列大于 1 表示发生过故障切换
 
-设置 `"webui": { "enabled": false }` 可关闭面板，此时 `/_mini/requests` 与 `/_mini/stats` 仍然可用。
+### 渠道与模型
+
+- 渠道列表：查看每个渠道的 Base URL、掩码后的 key、优先级、支持的接口和模型数量；
+  可一键启用/停用、编辑、删除
+- 新增或编辑渠道：填 Base URL、API Key、认证方式（Bearer 或 x-api-key）、优先级、
+  启用状态和支持的接口
+- 模型映射：左侧填客户端请求用的模型名（别名），右侧填转发到上游的真实模型名。
+  点「拉取上游模型」会用该渠道自己的凭据请求上游 `/models`，拉到的列表会把右侧变成
+  下拉框方便选择；拉取只在点按钮时发生，启动时不会自动请求上游
+
+### API Key
+
+管理对外提供给下游客户端的 key 列表。每个 key 有名称、值、备注和独立开关，任意一个启用的
+key 都可以通过校验；停用后立即失效。名称会记录到请求日志里，因此可以按 key 统计用量、
+筛选日志。列表为空时代理不校验来访身份。
+
+### 修改如何生效
+
+面板的保存操作会先校验，再热应用到运行中的代理（无需重启），然后写回 `config.json`。
+校验失败的改动会被拒绝，运行中的配置保持原样。
+
+几点注意：
+
+- `host` 和 `port` 面板只读，改这两项仍需重启
+- `requestLog`、`progress` 等在启动时就已初始化，改动同样需要重启才生效
+- 已保存的 key（渠道的和对外的）只显示掩码；提交时留空表示保持原值
+- 写接口和读接口一样仅限 loopback 访问，没有额外口令——这意味着本机上的任何进程或网页
+  都可以改配置。如果不希望面板能改配置，设置 `"webui": { "enabled": false }`
+
+对应的接口：
+
+```text
+GET  /_mini/config          读取脱敏后的配置
+POST /_mini/config          { "action": "...", "payload": { ... } }
+POST /_mini/config/models   { "name": "渠道名" } 拉取该渠道的上游模型列表
+```
+
+`action` 支持 `saveChannel`、`deleteChannel`、`toggleChannel`、`saveModels`、`saveClientKeys`。
+
+设置 `"webui": { "enabled": false }` 可关闭面板和配置写接口，此时 `/_mini/requests`
+与 `/_mini/stats` 仍然可用。
 
 ## Windows 置顶悬浮窗
 
@@ -577,6 +657,9 @@ GET http://127.0.0.1:8317/_mini/status
 - 默认只监听 `127.0.0.1`。
 - 建议设置一个不易猜测的 `clientApiKey`，不要使用示例值。
 - `clientApiKey` 与 `upstream.apiKey` 用途不同：前者验证本地客户端，后者认证上游。
+- 面板的配置写接口只靠 loopback 限制保护，没有额外口令。也就是说本机上的任何进程或网页都能
+  增删渠道、改模型映射、改对外 key（读取时 key 是掩码的，但可以被覆盖成新值）。
+  不需要这个能力时用 `"webui": { "enabled": false }` 关掉。
 - 不要把带真实 API Key 的 `config.json` 提交到 Git 或发给他人。
 - 如果把 `host` 改为 `0.0.0.0` 或 `::`，程序会输出网络暴露警告。
 - 这个代理本身不提供用户认证、限流或公网防护，不建议直接暴露到局域网或互联网。

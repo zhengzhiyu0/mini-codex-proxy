@@ -1104,3 +1104,310 @@ test('request logging persists to logs/requests.jsonl unless file is set to null
   const memoryOnly = validateAndNormalizeConfig({ ...base, requestLog: { file: null } });
   assert.equal(memoryOnly.requestLog.file, null);
 });
+
+test('several named client keys authorize, and a disabled key is refused', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { prompt_tokens: 10, completion_tokens: 2 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const proxyServer = createProxyServer(makeConfig(upstreamPort, {
+    clientApiKey: undefined,
+    clientApiKeys: [
+      { name: 'laptop', key: 'sk-laptop', enabled: true },
+      { name: 'ci', key: 'sk-ci', enabled: false },
+    ],
+  }));
+  const proxyPort = await listen(proxyServer);
+  t.after(async () => { await close(proxyServer); await close(upstream); });
+
+  const call = (key, header = 'authorization') => request({
+    port: proxyPort,
+    headers: {
+      'content-type': 'application/json',
+      [header]: header === 'authorization' ? `Bearer ${key}` : key,
+    },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+
+  assert.equal((await call('sk-laptop')).statusCode, 200);
+  // Anthropic-style clients present the key in x-api-key instead.
+  assert.equal((await call('sk-laptop', 'x-api-key')).statusCode, 200);
+  assert.equal((await call('sk-ci')).statusCode, 401);
+  assert.equal((await call('sk-nope')).statusCode, 401);
+
+  const logged = await request({ port: proxyPort, path: '/_mini/requests', method: 'GET' });
+  const entries = JSON.parse(logged.body.toString('utf8')).entries;
+  const names = entries.filter((entry) => entry.status === 200).map((entry) => entry.apiKeyName);
+  assert.deepEqual(names, ['laptop', 'laptop']);
+});
+
+test('a legacy single clientApiKey string still authorizes', () => {
+  const config = validateAndNormalizeConfig({
+    host: '127.0.0.1',
+    port: 8317,
+    upstream: { baseUrl: 'http://127.0.0.1:9/v1', apiKey: '' },
+    clientApiKey: 'legacy-key',
+  });
+  assert.deepEqual(config.clientApiKeys, [
+    { name: 'default', key: 'legacy-key', enabled: true, note: '' },
+  ]);
+});
+
+test('log filters combine and honour date presets and explicit windows', () => {
+  const now = Date.parse('2026-03-10T12:00:00Z');
+  const presets = proxy.parseLogFilters(
+    new URLSearchParams('range=7d&group=a&model=m&apiKey=k'),
+    now,
+  );
+  assert.equal(presets.group, 'a');
+  assert.equal(presets.model, 'm');
+  assert.equal(presets.apiKey, 'k');
+  assert.equal(presets.since, now - 7 * 86400000);
+
+  const month = proxy.parseLogFilters(new URLSearchParams('range=30d'), now);
+  assert.equal(month.since, now - 30 * 86400000);
+
+  // An explicit window always wins over the preset.
+  const explicit = proxy.parseLogFilters(
+    new URLSearchParams('range=30d&since=2026-03-01T00:00:00Z&until=2026-03-02T00:00:00Z'),
+    now,
+  );
+  assert.equal(explicit.since, Date.parse('2026-03-01T00:00:00Z'));
+  assert.equal(explicit.until, Date.parse('2026-03-02T00:00:00Z'));
+
+  assert.equal(proxy.parseLogFilters(new URLSearchParams(''), now).since, undefined);
+});
+
+test('a date range reaching past the memory cache is served from the jsonl history', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mini-proxy-range-'));
+  const file = path.join(dir, 'requests.jsonl');
+  const now = Date.now();
+  const rows = [];
+  // Older than the in-memory limit below, so these can only come from the file.
+  for (let i = 0; i < 12; i += 1) {
+    rows.push({
+      seq: i + 1,
+      id: `id-${i}`,
+      at: new Date(now - (40 - i) * 86400000).toISOString(),
+      group: i % 2 ? 'beta' : 'alpha',
+      model: 'gpt-test',
+      apiKeyName: i % 2 ? 'ci' : 'laptop',
+      status: 200,
+      failed: false,
+      usage: {
+        promptTokens: 100, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0,
+      },
+    });
+  }
+  fs.writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxyServer = createProxyServer(makeConfig(upstreamPort, {
+    requestLog: { enabled: true, limit: 3, file },
+  }));
+  const proxyPort = await listen(proxyServer);
+  t.after(async () => { await close(proxyServer); await close(upstream); });
+
+  const query = async (search) => JSON.parse((await request({
+    port: proxyPort, path: `/_mini/requests?limit=100&${search}`, method: 'GET',
+  })).body.toString('utf8'));
+
+  // Only the newest 3 entries live in memory.
+  assert.equal((await query('')).total, 3);
+  const since = new Date(now - 45 * 86400000).toISOString();
+  assert.equal((await query(`since=${since}`)).matched, 12);
+  assert.equal((await query(`since=${since}&group=alpha&apiKey=laptop`)).matched, 6);
+});
+
+test('dashboard config edits hot-apply, persist, and never expose secrets', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mini-proxy-config-'));
+  const file = path.join(dir, 'config.json');
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'real-a' }, { id: 'real-b' }] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const raw = {
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      alpha: {
+        upstream: {
+          name: 'alpha',
+          baseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+          apiKey: 'sk-alpha-secret',
+        },
+        models: { 'gpt-test': 'real-a' },
+        endpoints: ['responses', 'chat', 'models'],
+      },
+    },
+    activeGroups: ['alpha'],
+    clientApiKeys: [{ name: 'laptop', key: 'sk-laptop', enabled: true }],
+    requestLog: { file: null },
+    keepThis: 'untouched',
+  };
+  fs.writeFileSync(file, JSON.stringify(raw));
+  const proxyServer = proxy.createProxyServer(raw, { configFile: file, log() {} });
+  const proxyPort = await listen(proxyServer);
+  t.after(async () => { await close(proxyServer); await close(upstream); });
+
+  const post = (target, body) => request({
+    port: proxyPort,
+    path: target,
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const readDisk = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+
+  const viewed = await request({ port: proxyPort, path: '/_mini/config', method: 'GET' });
+  const view = viewed.body.toString('utf8');
+  assert.equal(JSON.parse(view).groups[0].upstreams[0].hasApiKey, true);
+  assert.ok(!view.includes('sk-alpha-secret'));
+  assert.ok(!view.includes('sk-laptop'));
+
+  const pulled = await post('/_mini/config/models', { name: 'alpha' });
+  assert.deepEqual(JSON.parse(pulled.body.toString('utf8')).models, ['real-a', 'real-b']);
+
+  // An empty apiKey means "keep the stored secret".
+  const saved = await post('/_mini/config', {
+    action: 'saveChannel',
+    payload: {
+      name: 'alpha',
+      baseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+      apiKey: '',
+      priority: 5,
+      enabled: true,
+      endpoints: ['responses', 'chat', 'models'],
+    },
+  });
+  assert.equal(saved.statusCode, 200);
+  assert.equal(readDisk().groups.alpha.upstream.apiKey, 'sk-alpha-secret');
+  assert.equal(readDisk().groups.alpha.priority, 5);
+  assert.deepEqual(readDisk().groups.alpha.endpoints, ['responses', 'chat', 'models']);
+  assert.equal(readDisk().keepThis, 'untouched');
+
+  await post('/_mini/config', {
+    action: 'saveModels',
+    payload: { name: 'alpha', models: { alias: 'real-b' } },
+  });
+  assert.deepEqual(readDisk().groups.alpha.models, { alias: 'real-b' });
+
+  // The new mapping must route without a restart.
+  const routed = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-laptop' },
+    body: JSON.stringify({ model: 'alias', input: 'hi' }),
+  });
+  assert.equal(routed.statusCode, 200);
+
+  await post('/_mini/config', {
+    action: 'saveClientKeys',
+    payload: {
+      keys: [
+        { name: 'laptop', key: '', enabled: false },
+        { name: 'phone', key: 'sk-phone', enabled: true },
+      ],
+    },
+  });
+  assert.equal(readDisk().clientApiKeys.find((k) => k.name === 'laptop').key, 'sk-laptop');
+  const refused = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-laptop' },
+    body: JSON.stringify({ model: 'alias', input: 'hi' }),
+  });
+  assert.equal(refused.statusCode, 401);
+});
+
+test('an invalid config edit is rejected and leaves the running proxy untouched', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxyServer = createProxyServer(makeConfig(upstreamPort), { log() {} });
+  const proxyPort = await listen(proxyServer);
+  t.after(async () => { await close(proxyServer); await close(upstream); });
+
+  const post = (body) => request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  const badUrl = await post({
+    action: 'saveChannel',
+    payload: { name: 'broken', baseUrl: 'not-a-url' },
+  });
+  assert.equal(badUrl.statusCode, 400);
+  assert.equal((await post({ action: 'launchMissiles', payload: {} })).statusCode, 400);
+  assert.equal((await post({ action: 'deleteChannel', payload: { name: '' } })).statusCode, 400);
+
+  // The rejected edits must not have disturbed routing.
+  const still = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+  assert.equal(still.statusCode, 200);
+});
+
+test('config edits are not persisted unless a configFile is supplied', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxyServer = createProxyServer(makeConfig(upstreamPort), { log() {} });
+  const proxyPort = await listen(proxyServer);
+  t.after(async () => { await close(proxyServer); await close(upstream); });
+
+  const before = fs.readFileSync(path.resolve(__dirname, '..', 'config.json'), 'utf8');
+  const saved = await request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      action: 'saveModels',
+      payload: { name: 'default', models: { alias: 'gpt-5.4' } },
+    }),
+  });
+  assert.equal(saved.statusCode, 200);
+  // The repository config.json must be untouched when no configFile was given.
+  assert.equal(fs.readFileSync(path.resolve(__dirname, '..', 'config.json'), 'utf8'), before);
+});
+
+test('config mutations preserve unrelated groups and keep activeGroups consistent', () => {
+  const raw = {
+    groups: {
+      a: { upstream: { baseUrl: 'https://a.test/v1' }, models: {} },
+      b: { upstream: { baseUrl: 'https://b.test/v1' }, models: {} },
+    },
+    activeGroups: ['a', 'b'],
+  };
+
+  const disabled = proxy.applyConfigMutation(raw, 'toggleChannel', { name: 'b', enabled: false });
+  assert.deepEqual(disabled.activeGroups, ['a']);
+  assert.deepEqual(Object.keys(disabled.groups), ['a', 'b']);
+
+  const removed = proxy.applyConfigMutation(raw, 'deleteChannel', { name: 'a' });
+  assert.deepEqual(Object.keys(removed.groups), ['b']);
+  assert.deepEqual(removed.activeGroups, ['b']);
+
+  assert.throws(
+    () => proxy.applyConfigMutation(raw, 'saveModels', { name: 'nope', models: {} }),
+    /Unknown channel/,
+  );
+  assert.throws(
+    () => proxy.applyConfigMutation(raw, 'saveChannel', { name: 'has/slash' }),
+    /must not contain/,
+  );
+});

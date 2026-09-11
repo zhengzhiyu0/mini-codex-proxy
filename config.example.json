@@ -59,7 +59,20 @@
       ]
     }
   },
-  "clientApiKey": "change-this-local-key",
+  "clientApiKeys": [
+    {
+      "name": "laptop",
+      "key": "change-this-local-key",
+      "enabled": true,
+      "note": "本机 Codex"
+    },
+    {
+      "name": "ci",
+      "key": "change-this-ci-key",
+      "enabled": false,
+      "note": "需要时再启用"
+    }
+  ],
   "forwardClientAuthorization": false,
   "logging": {
     "enabled": true

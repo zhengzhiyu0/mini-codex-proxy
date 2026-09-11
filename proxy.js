@@ -141,6 +141,43 @@ function normalizeAuthStyle(value, fieldName) {
   return style;
 }
 
+// Accepts the legacy single `clientApiKey` string alongside the richer `clientApiKeys`
+// list so existing config.json files keep working unchanged.
+function normalizeClientApiKeys(input) {
+  const source = input.clientApiKeys !== undefined
+    ? input.clientApiKeys
+    : (input.clientApiKey === undefined ? [] : [{ name: 'default', key: input.clientApiKey }]);
+
+  if (typeof source === 'string') {
+    return source.trim() ? [{ name: 'default', key: source, enabled: true, note: '' }] : [];
+  }
+  if (!Array.isArray(source)) {
+    throw new Error('Invalid clientApiKeys: expected an array');
+  }
+
+  const keys = [];
+  const seen = new Set();
+  for (const [index, item] of source.entries()) {
+    const entry = typeof item === 'string' ? { key: item } : item;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`Invalid clientApiKeys[${index}]`);
+    }
+    const key = typeof entry.key === 'string' ? entry.key.trim() : '';
+    if (!key) continue;
+    if (seen.has(key)) {
+      throw new Error(`Duplicate clientApiKeys[${index}].key`);
+    }
+    seen.add(key);
+    keys.push({
+      name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : `key-${index + 1}`,
+      key,
+      enabled: entry.enabled !== false,
+      note: typeof entry.note === 'string' ? entry.note : '',
+    });
+  }
+  return keys;
+}
+
 function normalizeUpstreams(input, fieldPrefix) {
   if (Array.isArray(input.upstreams) && input.upstreams.length > 0) {
     return input.upstreams.map((upstream, index) => {
@@ -379,13 +416,15 @@ function validateAndNormalizeConfig(input) {
     }
   }
 
+  const clientApiKeys = normalizeClientApiKeys(input);
+
   const config = {
     host: host.trim(),
     port,
     groups,
     activeGroups,
     routes,
-    clientApiKey: typeof input.clientApiKey === 'string' ? input.clientApiKey : '',
+    clientApiKeys,
     forwardClientAuthorization: input.forwardClientAuthorization === true,
     logging: { enabled: input.logging?.enabled !== false },
     progress: {
@@ -418,18 +457,20 @@ function validateAndNormalizeConfig(input) {
   return config;
 }
 
-function loadConfig(configPath = path.join(__dirname, 'config.json')) {
+function readRawConfig(configPath) {
   if (!fs.existsSync(configPath)) {
     throw new Error(`config.json not found: ${configPath}`);
   }
 
-  let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
   } catch (error) {
     throw new Error(`Invalid config.json: ${error.message}`);
   }
-  return validateAndNormalizeConfig(parsed);
+}
+
+function loadConfig(configPath = path.join(__dirname, 'config.json')) {
+  return validateAndNormalizeConfig(readRawConfig(configPath));
 }
 
 function endpointForPath(pathname) {
@@ -471,6 +512,7 @@ function inspectRequestBody(body, contentEncoding) {
     parsed: null,
     rewritable: false,
     requestedModel: undefined,
+    reasoningEffort: null,
     stream: false,
   };
 
@@ -489,6 +531,17 @@ function inspectRequestBody(body, contentEncoding) {
     result.stream = parsed.stream === true;
     if (typeof parsed.model === 'string') {
       result.requestedModel = parsed.model;
+    }
+    if (typeof parsed.reasoning_effort === 'string') {
+      result.reasoningEffort = parsed.reasoning_effort;
+    } else if (typeof parsed.thinking === 'string') {
+      result.reasoningEffort = parsed.thinking;
+    } else if (parsed.thinking && typeof parsed.thinking.effort === 'string') {
+      result.reasoningEffort = parsed.thinking.effort;
+    } else if (parsed.reasoning && typeof parsed.reasoning.effort === 'string') {
+      result.reasoningEffort = parsed.reasoning.effort;
+    } else if (typeof parsed.effort === 'string') {
+      result.reasoningEffort = parsed.effort;
     }
   } catch {
     // Preserve malformed JSON so the upstream can return its native error response.
@@ -521,7 +574,7 @@ function prepareRequestHeaders(clientHeaders, upstream, config, body, forceIdent
     headers['accept-encoding'] = 'identity';
   }
 
-  if (!config.clientApiKey && config.forwardClientAuthorization && clientHeaders.authorization) {
+  if (config.clientApiKeys.length === 0 && config.forwardClientAuthorization && clientHeaders.authorization) {
     headers.authorization = clientHeaders.authorization;
   } else if (upstream.apiKey) {
     if (upstream.authStyle === 'x-api-key') headers['x-api-key'] = upstream.apiKey;
@@ -548,15 +601,30 @@ function safeTokenEqual(actual, expected) {
   return crypto.timingSafeEqual(actualHash, expectedHash);
 }
 
-function isClientAuthorized(request, config) {
-  if (!config.clientApiKey) return true;
+// Returns which named key matched so the request log can attribute traffic per key.
+// Disabled keys never authorize, and the secret itself is never surfaced to callers.
+function authorizeClient(request, config) {
+  const keys = config.clientApiKeys;
+  if (keys.length === 0) return { authorized: true, key: null };
+
   // Codex / OpenAI clients send Authorization: Bearer <key>;
   // Claude Code / Anthropic clients send x-api-key: <key>.
+  const presented = [];
   const bearer = extractBearerToken(request.headers.authorization);
-  if (safeTokenEqual(bearer, config.clientApiKey)) return true;
+  if (bearer) presented.push(bearer);
   const apiKeyHeader = request.headers['x-api-key'];
   const apiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
-  return safeTokenEqual(typeof apiKey === 'string' ? apiKey.trim() : apiKey, config.clientApiKey);
+  if (typeof apiKey === 'string' && apiKey.trim()) presented.push(apiKey.trim());
+
+  for (const candidate of presented) {
+    for (const record of keys) {
+      if (!safeTokenEqual(candidate, record.key)) continue;
+      return record.enabled
+        ? { authorized: true, key: record }
+        : { authorized: false, key: null };
+    }
+  }
+  return { authorized: false, key: null };
 }
 
 function prepareResponseHeaders(upstreamHeaders) {
@@ -604,6 +672,8 @@ function serializeMonitorRequest(metrics, now = process.hrtime.bigint()) {
     mappedModel: metrics.mappedModel || null,
     group: metrics.group || null,
     upstream: metrics.upstream || null,
+    apiKeyName: metrics.apiKeyName || null,
+    reasoningEffort: metrics.reasoningEffort || null,
     status: metrics.status || null,
     usage: metrics.usage || null,
     cacheHitRate: cacheHitRate(metrics.usage),
@@ -619,7 +689,7 @@ function serializeMonitorRequest(metrics, now = process.hrtime.bigint()) {
   };
 }
 
-function createMonitorState(config) {
+function createMonitorState(getConfig) {
   const active = new Map();
   const history = [];
   let latest = null;
@@ -637,6 +707,7 @@ function createMonitorState(config) {
     },
     snapshot() {
       const now = process.hrtime.bigint();
+      const config = getConfig();
       const activeRequests = Array.from(active.values()).map((metrics) => (
         serializeMonitorRequest(metrics, now)
       ));
@@ -857,21 +928,65 @@ function loadRequestLogFile(file, limit) {
     const chunkSize = Math.min(size, Math.max(64 * 1024, limit * 2048));
     const buffer = Buffer.alloc(chunkSize);
     fs.readSync(fd, buffer, 0, chunkSize, size - chunkSize);
-    const lines = buffer.toString('utf8').split('\n');
-    if (size > chunkSize) lines.shift();
-
-    const loaded = [];
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const entry = JSON.parse(trimmed);
-        if (entry && typeof entry === 'object' && !Array.isArray(entry)) loaded.push(entry);
-      } catch {
-        // Skip a truncated last line from a crash mid-append.
-      }
-    }
+    const loaded = parseHistoryLines(buffer.toString('utf8'), size > chunkSize);
     return loaded.length > limit ? loaded.slice(-limit) : loaded;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// A month-long dashboard query can reach past the in-memory cache. The jsonl is
+// append-only and chronologically ordered, so scanning backwards from the end lets a
+// bounded read satisfy the window instead of slurping the whole file.
+const MAX_HISTORY_READ_BYTES = 32 * 1024 * 1024;
+
+function parseHistoryLines(text, dropFirstLine) {
+  const lines = text.split('\n');
+  if (dropFirstLine) lines.shift();
+  const entries = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed);
+      if (entry && typeof entry === 'object' && !Array.isArray(entry)) entries.push(entry);
+    } catch {
+      // Skip a truncated line from a crash mid-append.
+    }
+  }
+  return entries;
+}
+
+function readHistorySince(file, sinceMs) {
+  if (!file) return [];
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return [];
+  }
+
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size === 0) return [];
+
+    let readBytes = Math.min(size, 1024 * 1024);
+    for (;;) {
+      const buffer = Buffer.alloc(readBytes);
+      fs.readSync(fd, buffer, 0, readBytes, size - readBytes);
+      const reachedStart = readBytes >= size;
+      const entries = parseHistoryLines(buffer.toString('utf8'), !reachedStart);
+
+      const oldest = entries.length > 0 ? Date.parse(entries[0].at) : NaN;
+      const coversWindow = Number.isFinite(oldest) && oldest <= sinceMs;
+      if (coversWindow || reachedStart || readBytes >= MAX_HISTORY_READ_BYTES) {
+        return entries.filter((entry) => {
+          const at = Date.parse(entry.at);
+          return Number.isFinite(at) && at >= sinceMs;
+        });
+      }
+      readBytes = Math.min(size, Math.min(readBytes * 2, MAX_HISTORY_READ_BYTES));
+    }
   } finally {
     fs.closeSync(fd);
   }
@@ -914,6 +1029,8 @@ function createRequestLog(config) {
         mappedModel: metrics.mappedModel || null,
         group: metrics.group || null,
         upstream: metrics.upstream || null,
+        apiKeyName: metrics.apiKeyName || null,
+        reasoningEffort: metrics.reasoningEffort || null,
         status: metrics.status || null,
         stream: metrics.stream === true,
         requestBytes: metrics.requestBytes || 0,
@@ -932,29 +1049,62 @@ function createRequestLog(config) {
       appendToFile(entry);
       return entry;
     },
-    query({ limit: max = 100, group, model, status, cached } = {}) {
-      let result = entries;
-      if (group) result = result.filter((entry) => entry.group === group);
-      if (model) result = result.filter((entry) => entry.model === model || entry.mappedModel === model);
-      if (status === 'ok') result = result.filter((entry) => !entry.failed);
-      else if (status === 'failed') result = result.filter((entry) => entry.failed);
-      if (cached === 'hit') result = result.filter((entry) => (entry.usage?.cacheReadTokens || 0) > 0);
-      else if (cached === 'miss') result = result.filter((entry) => entry.usage && !entry.usage.cacheReadTokens);
+    // Filters combine with AND so the dashboard can narrow by key + channel + model at once.
+    select(options = {}) {
+      const { group, model, apiKey, status, cached, since, until } = options;
+      const sinceMs = since === undefined ? null : since;
+      const untilMs = until === undefined ? null : until;
+
+      let pool = entries;
+      const oldestInMemory = entries.length > 0
+        ? Date.parse(entries[entries.length - 1].at)
+        : Infinity;
+      // The in-memory ring only holds `limit` entries; a longer window needs the file.
+      if (sinceMs !== null && file && (entries.length >= limit || entries.length === 0)
+        && !(Number.isFinite(oldestInMemory) && oldestInMemory <= sinceMs)) {
+        const bySeq = new Map();
+        for (const entry of readHistorySince(file, sinceMs)) bySeq.set(entry.seq, entry);
+        for (const entry of entries) bySeq.set(entry.seq, entry);
+        pool = [...bySeq.values()].sort((a, b) => (b.seq || 0) - (a.seq || 0));
+      }
+
+      const total = pool.length;
+      const matched = pool.filter((entry) => {
+        if (group && entry.group !== group) return false;
+        if (model && entry.model !== model && entry.mappedModel !== model) return false;
+        if (apiKey && (entry.apiKeyName || '') !== apiKey) return false;
+        if (status === 'ok' && entry.failed) return false;
+        if (status === 'failed' && !entry.failed) return false;
+        if (cached === 'hit' && !((entry.usage?.cacheReadTokens || 0) > 0)) return false;
+        if (cached === 'miss' && !(entry.usage && !entry.usage.cacheReadTokens)) return false;
+        if (sinceMs !== null || untilMs !== null) {
+          const at = Date.parse(entry.at);
+          if (!Number.isFinite(at)) return false;
+          if (sinceMs !== null && at < sinceMs) return false;
+          if (untilMs !== null && at > untilMs) return false;
+        }
+        return true;
+      });
+      return { total, matched };
+    },
+    query({ limit: max = 100, ...filters } = {}) {
+      const { total, matched } = this.select(filters);
       return {
-        total: entries.length,
-        matched: result.length,
-        totals: summarizeUsage(result),
-        entries: result.slice(0, max),
+        total,
+        matched: matched.length,
+        totals: summarizeUsage(matched),
+        entries: matched.slice(0, max),
       };
     },
-    stats() {
+    stats(filters = {}) {
+      const { matched } = this.select(filters);
       const byGroup = {};
       const byModel = {};
-      for (const entry of entries) {
-        const groupKey = entry.group || 'unknown';
-        const modelKey = entry.model || entry.mappedModel || 'unknown';
-        (byGroup[groupKey] ||= []).push(entry);
-        (byModel[modelKey] ||= []).push(entry);
+      const byApiKey = {};
+      for (const entry of matched) {
+        (byGroup[entry.group || 'unknown'] ||= []).push(entry);
+        (byModel[entry.model || entry.mappedModel || 'unknown'] ||= []).push(entry);
+        (byApiKey[entry.apiKeyName || 'unknown'] ||= []).push(entry);
       }
       const shape = (source) => Object.fromEntries(
         Object.entries(source).map(([key, list]) => [key, {
@@ -964,9 +1114,10 @@ function createRequestLog(config) {
         }]),
       );
       return {
-        overall: { requests: entries.length, ...summarizeUsage(entries) },
+        overall: { requests: matched.length, ...summarizeUsage(matched) },
         byGroup: shape(byGroup),
         byModel: shape(byModel),
+        byApiKey: shape(byApiKey),
       };
     },
     flush() {
@@ -1014,6 +1165,53 @@ td.n{text-align:right}
 .hit{color:var(--cool)}.dim{color:var(--dim)}
 .wrap{max-height:420px;overflow:auto}
 .empty{padding:16px;color:var(--dim)}
+nav{display:flex;gap:4px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--bg)}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
+font:inherit;padding:9px 12px;cursor:pointer}
+nav button.on{color:var(--fg);border-bottom-color:var(--cool)}
+.view{display:none}.view.on{display:grid;gap:18px}
+.bar2{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 14px;
+background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.bar2 label{color:var(--dim);font-size:11px}
+select,input{background:var(--bg);color:var(--fg);border:1px solid var(--line);
+border-radius:5px;padding:4px 7px;font:inherit;font-size:12px}
+input[type=date]{color-scheme:dark}
+button.act{background:var(--line);color:var(--fg);border:1px solid var(--line);
+border-radius:5px;padding:4px 10px;font:inherit;font-size:11px;cursor:pointer}
+button.act:hover{border-color:var(--cool)}
+button.act.pri{background:var(--cool);border-color:var(--cool);color:#08131f}
+button.act.del{color:var(--bad)}
+.seg{display:flex;gap:0;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+.seg button{background:var(--bg);border:0;border-right:1px solid var(--line);color:var(--dim);
+font:inherit;font-size:11px;padding:4px 10px;cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--cool);color:#08131f}
+.pad{padding:14px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;
+border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.row .nm{font-weight:600;min-width:120px}
+.row .gr{flex:1;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{border:1px solid var(--line);border-radius:10px;padding:1px 7px;font-size:10px;color:var(--dim)}
+.tag.on{color:var(--ok);border-color:var(--ok)}
+.tag.off{color:var(--dim)}
+.grid2{display:grid;gap:8px;grid-template-columns:1fr 1fr;padding:14px}
+.grid2 label{display:grid;gap:4px;color:var(--dim);font-size:11px}
+.grid2.full{grid-template-columns:1fr}
+.map{display:grid;gap:6px;padding:14px}
+.map .mrow{display:grid;grid-template-columns:1fr 24px 1fr auto;gap:6px;align-items:center}
+.map .arw{text-align:center;color:var(--dim)}
+.note{padding:0 14px 12px;color:var(--dim);font-size:11px}
+dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:8px;
+padding:0;min-width:min(560px,92vw);font:inherit}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+dialog h3{margin:0;padding:12px 14px;font-size:12px;color:var(--dim);font-weight:400;
+border-bottom:1px solid var(--line)}
+.dact{display:flex;gap:8px;justify-content:flex-end;padding:12px 14px;border-top:1px solid var(--line)}
+#toast{position:fixed;right:16px;bottom:16px;background:var(--panel);border:1px solid var(--line);
+border-radius:6px;padding:9px 13px;display:none;max-width:min(420px,80vw)}
+#toast.bad{border-color:var(--bad);color:var(--bad)}
+#toast.ok{border-color:var(--ok);color:var(--ok)}
 </style>
 </head>
 <body>
@@ -1022,17 +1220,52 @@ td.n{text-align:right}
 <span id="groups">connecting…</span>
 <span id="uptime" class="dim"></span>
 </header>
+<nav>
+<button data-view="monitor" class="on">监控</button>
+<button data-view="channels">渠道与模型</button>
+<button data-view="keys">API Key</button>
+</nav>
 <main>
+
+<div class="view on" id="view-monitor">
+<div class="bar2">
+<label>时间
+<span class="seg" id="range">
+<button data-range="today">当日</button>
+<button data-range="7d" class="on">7 天</button>
+<button data-range="30d">一个月</button>
+<button data-range="">全部</button>
+<button data-range="custom">自定义</button>
+</span>
+</label>
+<span id="customRange" style="display:none">
+<input type="date" id="since"> — <input type="date" id="until">
+</span>
+<label>渠道 <select id="fGroup"><option value="">全部</option></select></label>
+<label>模型 <select id="fModel"><option value="">全部</option></select></label>
+<label>Key <select id="fKey"><option value="">全部</option></select></label>
+<label>状态 <select id="fStatus">
+<option value="">全部</option><option value="ok">仅成功</option><option value="failed">仅失败</option>
+</select></label>
+<label>缓存 <select id="fCached">
+<option value="">全部</option><option value="hit">仅命中</option><option value="miss">仅未命中</option>
+</select></label>
+<button class="act" id="reset">重置</button>
+</div>
 <div class="cards" id="cards"></div>
 <section>
 <h2>活动请求 <span id="activeCount" class="dim"></span></h2>
 <div class="wrap"><table><thead><tr>
-<th>ID</th><th>模型</th><th>渠道</th><th>状态</th><th class="n">已用</th><th class="n">首包</th><th class="n">下行</th>
+<th>ID</th><th>模型</th><th>渠道</th><th>Key</th><th>状态</th><th class="n">已用</th><th class="n">首包</th><th class="n">下行</th>
 </tr></thead><tbody id="active"></tbody></table></div>
 </section>
 <section>
-<h2>渠道统计
-<select id="statsMode"><option value="byGroup">按渠道</option><option value="byModel">按模型</option></select>
+<h2>用量统计
+<select id="statsMode">
+<option value="byGroup">按渠道</option>
+<option value="byModel">按模型</option>
+<option value="byApiKey">按 Key</option>
+</select>
 </h2>
 <div class="wrap"><table><thead><tr>
 <th>名称</th><th class="n">请求</th><th class="n">失败</th><th class="n">输入</th><th class="n">输出</th>
@@ -1040,24 +1273,66 @@ td.n{text-align:right}
 </tr></thead><tbody id="stats"></tbody></table></div>
 </section>
 <section>
-<h2>请求日志
-<select id="filter">
-<option value="">全部</option>
-<option value="cached=hit">仅缓存命中</option>
-<option value="cached=miss">仅缓存未命中</option>
-<option value="status=failed">仅失败</option>
-<option value="status=ok">仅成功</option>
-</select>
-</h2>
+<h2>请求日志 <span id="logCount" class="dim"></span></h2>
 <div class="wrap"><table><thead><tr>
-<th>时间</th><th>模型</th><th>渠道</th><th class="n">状态</th><th class="n">耗时</th>
+<th>时间</th><th>模型</th><th>思考</th><th>渠道</th><th>Key</th><th class="n">状态</th><th class="n">耗时</th>
 <th class="n">输入</th><th class="n">输出</th><th class="n">缓存读</th><th class="n">命中率</th><th class="n">尝试</th>
 </tr></thead><tbody id="log"></tbody></table></div>
 </section>
+</div>
+
+<div class="view" id="view-channels">
+<section>
+<h2>渠道 <button class="act pri" id="addChannel" style="margin-left:auto">新增渠道</button></h2>
+<div id="channels"></div>
+</section>
+<section>
+<h2>模型映射
+<select id="mapGroup" style="margin-left:auto"></select>
+<button class="act" id="pullModels">拉取上游模型</button>
+<button class="act pri" id="saveModels">保存映射</button>
+</h2>
+<div class="map" id="mapRows"></div>
+<div class="note">左侧是客户端请求的模型名（别名），右侧是转发到上游的真实模型名。
+点“拉取上游模型”后右侧可从上游列表中选择。留空的行会被忽略。</div>
+</section>
+</div>
+
+<div class="view" id="view-keys">
+<section>
+<h2>对外 API Key
+<button class="act" id="addKey" style="margin-left:auto">新增 Key</button>
+<button class="act pri" id="saveKeys">保存</button>
+</h2>
+<div id="keys"></div>
+<div class="note">这些 key 供下游客户端调用本代理使用，任意一个启用的 key 均可通过校验。
+已保存的 key 只显示掩码；留空表示保持原值。禁用后该 key 立即失效。
+列表为空时代理不校验来访身份。</div>
+</section>
+</div>
+
 </main>
+<div id="toast"></div>
+<dialog id="dlg"><form id="dlgForm" method="dialog">
+<h3 id="dlgTitle">渠道</h3>
+<div class="grid2" id="dlgBody"></div>
+<div class="dact">
+<button class="act" value="cancel" type="submit">取消</button>
+<button class="act pri" id="dlgSave" value="save" type="submit">保存</button>
+</div>
+</form></dialog>
 <script>
 const $ = (id) => document.getElementById(id);
-const num = (v) => (v == null ? '-' : v.toLocaleString());
+const num = (v) => (v == null ? '-' : Number(v).toLocaleString());
+const tokens = (v) => {
+  if (v == null) return '-';
+  const n = Number(v);
+  if (n < 1000) return n.toLocaleString();
+  const units = ['k', 'm', 'b'];
+  let value = n; let unit = -1;
+  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1; }
+  return value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2).replace(/\\.0+$|(?<=\\.[0-9])0+$/, '') + units[unit];
+};
 const ms = (v) => (v == null ? '-' : v < 1000 ? v + 'ms' : (v / 1000).toFixed(2) + 's');
 const bytes = (v) => {
   if (!v) return '0';
@@ -1076,14 +1351,63 @@ function statusClass(entry) {
   return 's-ok';
 }
 
+let cfg = { groups: [], clientApiKeys: [], activeGroups: [] };
+const upstreamModels = {};
+let mapDraft = null;
+let keyDraft = null;
+
+function toast(message, ok) {
+  const el = $('toast');
+  el.textContent = message;
+  el.className = ok ? 'ok' : 'bad';
+  el.style.display = 'block';
+  clearTimeout(el.timer);
+  el.timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+}
+
+function filterQuery() {
+  const params = new URLSearchParams();
+  const active = document.querySelector('#range button.on');
+  const range = active ? active.dataset.range : '';
+  if (range === 'custom') {
+    if ($('since').value) params.set('since', new Date($('since').value + 'T00:00:00').toISOString());
+    if ($('until').value) params.set('until', new Date($('until').value + 'T23:59:59.999').toISOString());
+  } else if (range) {
+    params.set('range', range);
+  }
+  const pairs = [['fGroup', 'group'], ['fModel', 'model'], ['fKey', 'apiKey'],
+    ['fStatus', 'status'], ['fCached', 'cached']];
+  for (const [id, key] of pairs) {
+    if ($(id).value) params.set(key, $(id).value);
+  }
+  return params.toString();
+}
+
+function fillSelect(select, values, allLabel) {
+  const previous = select.value;
+  select.innerHTML = ['<option value="">' + (allLabel || '全部') + '</option>']
+    .concat(values.map((v) => '<option value="' + esc(v) + '">' + esc(v) + '</option>')).join('');
+  if (values.includes(previous)) select.value = previous;
+}
+
+// The mapping editor always targets exactly one channel, so it has no "all" option.
+function fillGroupSelect(values) {
+  const select = $('mapGroup');
+  const previous = select.value;
+  select.innerHTML = values.length
+    ? values.map((v) => '<option value="' + esc(v) + '">' + esc(v) + '</option>').join('')
+    : '<option value="">(无渠道)</option>';
+  if (values.includes(previous)) select.value = previous;
+}
+
 function renderCards(stats, status) {
   const o = stats.overall;
   const cards = [
     ['总请求', num(o.requests)],
     ['缓存命中率', pct(o.cacheHitRate), o.cacheHitRate],
-    ['缓存读取 tokens', num(o.cacheReadTokens)],
-    ['输入 tokens', num(o.promptTokens)],
-    ['输出 tokens', num(o.outputTokens)],
+    ['缓存读取 tokens', tokens(o.cacheReadTokens)],
+    ['输入 tokens', tokens(o.promptTokens)],
+    ['输出 tokens', tokens(o.outputTokens)],
     ['进行中', num(status ? status.activeCount : 0)],
   ];
   $('cards').innerHTML = cards.map(([label, value, ratio]) => (
@@ -1100,11 +1424,12 @@ function renderActive(status) {
     + '<td class="dim">' + esc(r.id) + '</td>'
     + '<td>' + esc(r.model || r.mappedModel || '-') + '</td>'
     + '<td>' + esc(r.group || '-') + '</td>'
+    + '<td class="dim">' + esc(r.apiKeyName || '-') + '</td>'
     + '<td class="' + statusClass(r) + '">' + esc(r.state) + '</td>'
     + '<td class="n">' + ms(r.elapsedMs) + '</td>'
     + '<td class="n">' + ms(r.firstByteMs) + '</td>'
     + '<td class="n">' + bytes(r.responseBytes) + '</td>'
-    + '</tr>').join('') : '<tr><td colspan="7" class="empty">暂无进行中的请求</td></tr>';
+    + '</tr>').join('') : '<tr><td colspan="8" class="empty">暂无进行中的请求</td></tr>';
 }
 
 function renderStats(stats) {
@@ -1123,21 +1448,107 @@ function renderStats(stats) {
 
 function renderLog(data) {
   const rows = data.entries || [];
+  $('logCount').textContent = '匹配 ' + num(data.matched) + ' / ' + num(data.total) + ' 条';
   $('log').innerHTML = rows.length ? rows.map((e) => {
     const u = e.usage || {};
     return '<tr>'
-      + '<td class="dim">' + esc(e.at.slice(11, 19)) + '</td>'
+      + '<td class="dim">' + esc(e.at.slice(5, 19).replace('T', ' ')) + '</td>'
       + '<td>' + esc(e.model || e.mappedModel || '-') + '</td>'
+      + '<td>' + esc(e.reasoningEffort || '-') + '</td>'
       + '<td>' + esc(e.group || '-') + '</td>'
+      + '<td class="dim">' + esc(e.apiKeyName || '-') + '</td>'
       + '<td class="n ' + statusClass(e) + '">' + esc(e.status || '-') + '</td>'
       + '<td class="n">' + ms(e.durationMs) + '</td>'
-      + '<td class="n">' + num(u.promptTokens) + '</td>'
-      + '<td class="n">' + num(u.outputTokens) + '</td>'
-      + '<td class="n hit">' + num(u.cacheReadTokens) + '</td>'
+      + '<td class="n">' + tokens(u.promptTokens) + '</td>'
+      + '<td class="n">' + tokens(u.outputTokens) + '</td>'
+      + '<td class="n hit">' + tokens(u.cacheReadTokens) + '</td>'
       + '<td class="n">' + pct(e.cacheHitRate) + '</td>'
       + '<td class="n ' + (e.attempts > 1 ? 's-run' : 'dim') + '">' + num(e.attempts) + '</td>'
       + '</tr>';
-  }).join('') : '<tr><td colspan="10" class="empty">暂无请求记录</td></tr>';
+  }).join('') : '<tr><td colspan="11" class="empty">暂无匹配的请求记录</td></tr>';
+}
+
+function renderChannels() {
+  $('channels').innerHTML = cfg.groups.length ? cfg.groups.map((g) => {
+    const up = g.upstreams[0] || {};
+    return '<div class="row">'
+      + '<span class="nm">' + esc(g.name) + '</span>'
+      + '<span class="tag ' + (g.enabled ? 'on' : 'off') + '">'
+      + (g.enabled ? '已启用' : '已停用') + '</span>'
+      + '<span class="gr">' + esc(up.baseUrl || '(未配置)')
+      + (up.hasApiKey ? ' · ' + esc(up.apiKeyMasked) : ' · 无 key')
+      + ' · 优先级 ' + g.priority
+      + ' · ' + esc(g.endpoints.join('/'))
+      + ' · ' + Object.keys(g.models).length + ' 个模型</span>'
+      + '<button class="act" data-toggle="' + esc(g.name) + '">'
+      + (g.enabled ? '停用' : '启用') + '</button>'
+      + '<button class="act" data-edit="' + esc(g.name) + '">编辑</button>'
+      + '<button class="act del" data-del="' + esc(g.name) + '">删除</button>'
+      + '</div>';
+  }).join('') : '<div class="empty">暂无渠道，点右上角新增。</div>';
+}
+
+// A pulled upstream list becomes a dropdown; otherwise the target stays free text.
+function mapTargetCell(target, list) {
+  if (!list || list.length === 0) {
+    return '<input class="mt" value="' + esc(target) + '" placeholder="上游模型名">';
+  }
+  const known = list.includes(target);
+  return '<select class="mt">'
+    + (known || !target ? '' : '<option value="' + esc(target) + '" selected>'
+      + esc(target) + ' (自定义)</option>')
+    + list.map((m) => '<option value="' + esc(m) + '"' + (m === target ? ' selected' : '') + '>'
+      + esc(m) + '</option>').join('')
+    + '</select>';
+}
+
+function renderMap() {
+  const name = $('mapGroup').value;
+  const group = cfg.groups.find((g) => g.name === name);
+  if (!group) { $('mapRows').innerHTML = '<div class="empty">请先新增渠道。</div>'; return; }
+  if (mapDraft === null) mapDraft = Object.entries(group.models);
+  const list = upstreamModels[name];
+  $('mapRows').innerHTML = mapDraft.map(([alias, target], i) => '<div class="mrow">'
+    + '<input class="ma" value="' + esc(alias) + '" placeholder="客户端模型名">'
+    + '<span class="arw">&rarr;</span>'
+    + mapTargetCell(target, list)
+    + '<button class="act del" data-maprm="' + i + '">删除</button>'
+    + '</div>').join('')
+    + '<div><button class="act" id="addMap">新增一行</button>'
+    + (list ? ' <span class="dim">上游可用 ' + list.length + ' 个模型</span>' : '')
+    + '</div>';
+}
+
+function readMapDraft() {
+  mapDraft = [...document.querySelectorAll('#mapRows .mrow')].map((row) => [
+    row.querySelector('.ma').value.trim(),
+    row.querySelector('.mt').value.trim(),
+  ]);
+  return mapDraft;
+}
+
+function renderKeys() {
+  if (keyDraft === null) keyDraft = cfg.clientApiKeys.map((k) => ({ ...k, key: '' }));
+  $('keys').innerHTML = keyDraft.length ? keyDraft.map((k, i) => '<div class="row">'
+    + '<input class="kn" value="' + esc(k.name) + '" placeholder="名称" style="min-width:120px">'
+    + '<input class="kv" value="' + esc(k.key) + '" placeholder="'
+    + (k.keyMasked ? esc(k.keyMasked) + '（留空保持不变）' : 'sk-...') + '" style="flex:1">'
+    + '<input class="kd" value="' + esc(k.note) + '" placeholder="备注" style="width:140px">'
+    + '<button class="act" data-ktoggle="' + i + '">'
+    + (k.enabled ? '已启用' : '已停用') + '</button>'
+    + '<button class="act del" data-krm="' + i + '">删除</button>'
+    + '</div>').join('') : '<div class="empty">暂无 key，当前不校验来访身份。</div>';
+}
+
+function readKeyDraft() {
+  keyDraft = [...document.querySelectorAll('#keys .row')].map((row, i) => ({
+    name: row.querySelector('.kn').value.trim(),
+    key: row.querySelector('.kv').value.trim(),
+    note: row.querySelector('.kd').value.trim(),
+    enabled: keyDraft[i] ? keyDraft[i].enabled : true,
+    keyMasked: keyDraft[i] ? keyDraft[i].keyMasked : '',
+  }));
+  return keyDraft;
 }
 
 async function get(url) {
@@ -1146,13 +1557,87 @@ async function get(url) {
   return res.json();
 }
 
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ? data.error.message : 'HTTP ' + res.status);
+  return data;
+}
+
+// The server answers with the new redacted config, so drafts are rebuilt from truth.
+async function mutate(action, payload, okMessage) {
+  try {
+    const data = await post('/_mini/config', { action, payload });
+    cfg = data.config;
+    mapDraft = null;
+    keyDraft = null;
+    renderChannels();
+    fillGroupSelect(cfg.groups.map((g) => g.name));
+    renderMap();
+    renderKeys();
+    toast(okMessage, true);
+  } catch (error) {
+    toast(error.message, false);
+  }
+}
+
+function openChannelDialog(existing) {
+  const g = existing || {
+    name: '', enabled: true, priority: 0, endpoints: ['responses', 'chat', 'models'],
+    upstreams: [{ baseUrl: '', authStyle: 'bearer', apiKeyMasked: '' }],
+  };
+  const up = g.upstreams[0] || {};
+  $('dlgTitle').textContent = existing ? '编辑渠道 ' + g.name : '新增渠道';
+  $('dlgBody').innerHTML = ''
+    + '<label>渠道名<input id="dName" value="' + esc(g.name) + '"'
+    + (existing ? ' readonly' : '') + ' placeholder="例如 my-channel"></label>'
+    + '<label>优先级<input id="dPri" type="number" value="' + g.priority + '"></label>'
+    + '<label style="grid-column:1/-1">Base URL<input id="dUrl" value="'
+    + esc(up.baseUrl || '') + '" placeholder="https://example.com/v1"></label>'
+    + '<label style="grid-column:1/-1">API Key<input id="dKey" placeholder="'
+    + (up.apiKeyMasked ? esc(up.apiKeyMasked) + '（留空保持不变）' : 'sk-...') + '"></label>'
+    + '<label>认证方式<select id="dAuth">'
+    + '<option value="bearer"' + (up.authStyle !== 'x-api-key' ? ' selected' : '') + '>Bearer</option>'
+    + '<option value="x-api-key"' + (up.authStyle === 'x-api-key' ? ' selected' : '')
+    + '>x-api-key</option></select></label>'
+    + '<label>状态<select id="dOn">'
+    + '<option value="1"' + (g.enabled ? ' selected' : '') + '>启用</option>'
+    + '<option value="0"' + (g.enabled ? '' : ' selected') + '>停用</option>'
+    + '</select></label>'
+    + '<label style="grid-column:1/-1">支持的接口<span>'
+    + ['responses', 'messages', 'chat', 'models'].map((e) => '<span style="margin-right:10px">'
+      + '<input type="checkbox" class="dEp" value="' + e + '"'
+      + (g.endpoints.includes(e) ? ' checked' : '') + '> ' + e + '</span>').join('')
+    + '</span></label>';
+  $('dlg').showModal();
+}
+
+function submitChannelDialog() {
+  const endpoints = [...document.querySelectorAll('.dEp')]
+    .filter((c) => c.checked).map((c) => c.value);
+  if (endpoints.length === 0) { toast('至少要选一个接口', false); return; }
+  mutate('saveChannel', {
+    name: $('dName').value.trim(),
+    baseUrl: $('dUrl').value.trim(),
+    apiKey: $('dKey').value.trim(),
+    authStyle: $('dAuth').value,
+    priority: Number($('dPri').value) || 0,
+    enabled: $('dOn').value === '1',
+    endpoints,
+  }, '渠道已保存并生效');
+}
+
 let timer = null;
 async function refresh() {
   try {
-    const query = $('filter').value;
+    const query = filterQuery();
     const [status, stats, log] = await Promise.all([
       get('/_mini/status').catch(() => null),
-      get('/_mini/stats'),
+      get('/_mini/stats' + (query ? '?' + query : '')),
       get('/_mini/requests?limit=200' + (query ? '&' + query : '')),
     ]);
     $('dot').className = 'on';
@@ -1164,13 +1649,142 @@ async function refresh() {
     renderCards(stats, status);
     renderStats(stats);
     renderLog(log);
+    fillSelect($('fGroup'), (cfg.groups || []).map((g) => g.name));
+    fillSelect($('fModel'), Object.keys(stats.byModel || {}).filter((m) => m !== 'unknown'));
+    fillSelect($('fKey'), (cfg.clientApiKeys || []).map((k) => k.name));
   } catch (error) {
     $('dot').className = '';
     $('groups').textContent = '连接失败: ' + error.message;
   }
 }
 
-for (const id of ['filter', 'statsMode']) $(id).addEventListener('change', refresh);
+async function loadConfigView() {
+  try {
+    cfg = await get('/_mini/config');
+    mapDraft = null;
+    keyDraft = null;
+    renderChannels();
+    fillGroupSelect(cfg.groups.map((g) => g.name));
+    renderMap();
+    renderKeys();
+  } catch (error) {
+    toast('读取配置失败: ' + error.message, false);
+  }
+}
+
+for (const button of document.querySelectorAll('nav button')) {
+  button.addEventListener('click', () => {
+    for (const b of document.querySelectorAll('nav button')) b.classList.toggle('on', b === button);
+    for (const v of document.querySelectorAll('.view')) {
+      v.classList.toggle('on', v.id === 'view-' + button.dataset.view);
+    }
+  });
+}
+
+$('range').addEventListener('click', (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  for (const b of $('range').children) b.classList.toggle('on', b === button);
+  $('customRange').style.display = button.dataset.range === 'custom' ? '' : 'none';
+  refresh();
+});
+
+for (const id of ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached', 'statsMode', 'since', 'until']) {
+  $(id).addEventListener('change', refresh);
+}
+
+$('reset').addEventListener('click', () => {
+  for (const id of ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached']) $(id).value = '';
+  refresh();
+});
+
+$('addChannel').addEventListener('click', () => openChannelDialog(null));
+
+$('channels').addEventListener('click', (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  if (button.dataset.toggle) {
+    const group = cfg.groups.find((g) => g.name === button.dataset.toggle);
+    mutate('toggleChannel', { name: group.name, enabled: !group.enabled },
+      (group.enabled ? '已停用 ' : '已启用 ') + group.name);
+  } else if (button.dataset.edit) {
+    openChannelDialog(cfg.groups.find((g) => g.name === button.dataset.edit));
+  } else if (button.dataset.del) {
+    const name = button.dataset.del;
+    if (confirm('确定删除渠道 ' + name + ' ？该操作会写入 config.json。')) {
+      mutate('deleteChannel', { name }, '已删除 ' + name);
+    }
+  }
+});
+
+$('dlgForm').addEventListener('submit', (event) => {
+  if (event.submitter && event.submitter.value === 'save') submitChannelDialog();
+});
+
+$('mapGroup').addEventListener('change', () => { mapDraft = null; renderMap(); });
+
+$('mapRows').addEventListener('click', (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  if (button.id === 'addMap') {
+    readMapDraft().push(['', '']);
+    renderMap();
+  } else if (button.dataset.maprm !== undefined) {
+    readMapDraft().splice(Number(button.dataset.maprm), 1);
+    renderMap();
+  }
+});
+
+$('pullModels').addEventListener('click', async () => {
+  const name = $('mapGroup').value;
+  if (!name) return;
+  $('pullModels').textContent = '拉取中…';
+  try {
+    const data = await post('/_mini/config/models', { name });
+    upstreamModels[name] = data.models;
+    readMapDraft();
+    renderMap();
+    toast('拉取到 ' + data.models.length + ' 个上游模型', true);
+  } catch (error) {
+    toast('拉取失败: ' + error.message, false);
+  } finally {
+    $('pullModels').textContent = '拉取上游模型';
+  }
+});
+
+$('saveModels').addEventListener('click', () => {
+  const name = $('mapGroup').value;
+  if (!name) return;
+  const models = {};
+  for (const [alias, target] of readMapDraft()) {
+    if (alias && target) models[alias] = target;
+  }
+  mutate('saveModels', { name, models }, '模型映射已保存并生效');
+});
+
+$('addKey').addEventListener('click', () => {
+  readKeyDraft().push({ name: '', key: '', note: '', enabled: true, keyMasked: '' });
+  renderKeys();
+});
+
+$('keys').addEventListener('click', (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  readKeyDraft();
+  if (button.dataset.krm !== undefined) {
+    keyDraft.splice(Number(button.dataset.krm), 1);
+  } else if (button.dataset.ktoggle !== undefined) {
+    const i = Number(button.dataset.ktoggle);
+    keyDraft[i].enabled = !keyDraft[i].enabled;
+  }
+  renderKeys();
+});
+
+$('saveKeys').addEventListener('click', () => {
+  const keys = readKeyDraft().filter((k) => k.name || k.key);
+  mutate('saveClientKeys', { keys }, 'API Key 已保存并生效');
+});
+
 function loop() {
   clearInterval(timer);
   timer = setInterval(refresh, 2000);
@@ -1179,12 +1793,222 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) clearInterval(timer);
   else { refresh(); loop(); }
 });
-refresh();
+loadConfigView().then(refresh);
 loop();
 </script>
 </body>
 </html>
 `;
+
+// Secrets are shown redacted; the editor sends an empty key to mean "keep the current one".
+function maskSecret(value) {
+  if (typeof value !== 'string' || !value) return '';
+  if (value.length <= 8) return '*'.repeat(value.length);
+  return `${value.slice(0, 4)}${'*'.repeat(Math.min(12, value.length - 8))}${value.slice(-4)}`;
+}
+
+function rawGroupUpstreams(group) {
+  if (Array.isArray(group.upstreams) && group.upstreams.length > 0) return group.upstreams;
+  return group.upstream ? [group.upstream] : [];
+}
+
+function buildConfigView(raw, config) {
+  // Without a `groups` block the top level itself describes the single "default" channel.
+  const rawGroups = raw.groups && typeof raw.groups === 'object' && !Array.isArray(raw.groups)
+    ? raw.groups
+    : {
+      default: {
+        upstream: raw.upstream,
+        upstreams: raw.upstreams,
+        models: raw.models,
+        endpoints: raw.endpoints,
+        priority: raw.priority,
+      },
+    };
+
+  return {
+    host: config.host,
+    port: config.port,
+    // host/port changes need a restart, so the editor shows them read-only.
+    restartRequiredFields: ['host', 'port'],
+    activeGroups: [...config.activeGroups],
+    groups: Object.entries(rawGroups).map(([name, group]) => ({
+      name,
+      enabled: config.activeGroups.includes(name),
+      priority: Number.isFinite(group.priority) ? group.priority : 0,
+      endpoints: group.endpoints ? [...group.endpoints] : [...ENDPOINT_NAMES],
+      injectMappedModels: group.injectMappedModels === true,
+      overrideModelList: group.overrideModelList === true,
+      models: { ...(group.models || {}) },
+      upstreams: rawGroupUpstreams(group).map((upstream, index) => ({
+        name: upstream.name || `upstream-${index + 1}`,
+        baseUrl: upstream.baseUrl || '',
+        apiKeyMasked: maskSecret(upstream.apiKey),
+        hasApiKey: Boolean(upstream.apiKey),
+        authStyle: upstream.authStyle || 'bearer',
+        priority: Number.isFinite(upstream.priority) ? upstream.priority : 0,
+      })),
+    })),
+    clientApiKeys: config.clientApiKeys.map((record) => ({
+      name: record.name,
+      keyMasked: maskSecret(record.key),
+      enabled: record.enabled,
+      note: record.note,
+    })),
+  };
+}
+
+async function writeConfigFile(file, raw) {
+  const temp = `${file}.${process.pid}.tmp`;
+  await fs.promises.writeFile(temp, `${JSON.stringify(raw, null, 2)}\n`);
+  await fs.promises.rename(temp, file);
+}
+
+function requireGroupName(payload) {
+  const name = typeof payload.name === 'string' ? payload.name.trim() : '';
+  if (!name) throw new Error('Missing channel name');
+  if (name.includes('/')) throw new Error('Channel name must not contain "/"');
+  return name;
+}
+
+function setGroupActive(activeGroups, name, enabled) {
+  const next = activeGroups.filter((item) => item !== name);
+  if (enabled) next.push(name);
+  return next;
+}
+
+// Returns a new raw config; unrelated top-level keys are preserved so hand-written
+// settings the panel does not surface survive a save.
+function applyConfigMutation(raw, action, payload = {}) {
+  const next = { ...raw };
+  // A config without `groups` describes one implicit "default" channel at the top level.
+  // Migrate it on first edit so the dashboard has something addressable.
+  if (raw.groups === undefined) {
+    next.groups = {
+      default: {
+        upstream: raw.upstream,
+        upstreams: raw.upstreams,
+        models: raw.models,
+        endpoints: raw.endpoints,
+        priority: raw.priority,
+        injectMappedModels: raw.injectMappedModels,
+        overrideModelList: raw.overrideModelList,
+      },
+    };
+    for (const key of ['upstream', 'upstreams', 'models', 'endpoints', 'priority',
+      'injectMappedModels', 'overrideModelList']) {
+      if (next.groups.default[key] === undefined) delete next.groups.default[key];
+      delete next[key];
+    }
+    next.activeGroups = ['default'];
+  }
+
+  const groups = { ...next.groups };
+  let activeGroups = parseGroupNameList(next.activeGroups ?? next.activeGroup ?? []);
+  if (next.activeGroups === undefined && next.activeGroup === undefined) {
+    activeGroups = Object.keys(groups);
+  }
+
+  if (action === 'saveChannel') {
+    const name = requireGroupName(payload);
+    const existing = groups[name];
+    const previousKey = rawGroupUpstreams(existing || {})[0]?.apiKey || '';
+    const submittedKey = typeof payload.apiKey === 'string' ? payload.apiKey.trim() : '';
+
+    groups[name] = {
+      ...existing,
+      priority: Number.isFinite(payload.priority) ? payload.priority : (existing?.priority ?? 0),
+      upstream: {
+        name,
+        baseUrl: typeof payload.baseUrl === 'string' ? payload.baseUrl.trim() : '',
+        // An empty submission means the panel never saw the secret, so keep it.
+        apiKey: submittedKey || previousKey,
+        authStyle: payload.authStyle === 'x-api-key' ? 'x-api-key' : 'bearer',
+      },
+      models: payload.models && typeof payload.models === 'object' && !Array.isArray(payload.models)
+        ? { ...payload.models }
+        : (existing?.models || {}),
+      endpoints: Array.isArray(payload.endpoints) && payload.endpoints.length > 0
+        ? [...payload.endpoints]
+        : (existing?.endpoints || [...ENDPOINT_NAMES]),
+    };
+    delete groups[name].upstreams;
+    activeGroups = setGroupActive(activeGroups, name, payload.enabled !== false);
+  } else if (action === 'deleteChannel') {
+    const name = requireGroupName(payload);
+    if (!groups[name]) throw new Error(`Unknown channel: ${name}`);
+    delete groups[name];
+    activeGroups = activeGroups.filter((item) => item !== name);
+  } else if (action === 'toggleChannel') {
+    const name = requireGroupName(payload);
+    if (!groups[name]) throw new Error(`Unknown channel: ${name}`);
+    activeGroups = setGroupActive(activeGroups, name, payload.enabled === true);
+  } else if (action === 'saveModels') {
+    const name = requireGroupName(payload);
+    if (!groups[name]) throw new Error(`Unknown channel: ${name}`);
+    if (!payload.models || typeof payload.models !== 'object' || Array.isArray(payload.models)) {
+      throw new Error('Invalid models: expected an object');
+    }
+    groups[name] = { ...groups[name], models: { ...payload.models } };
+  } else if (action === 'saveClientKeys') {
+    if (!Array.isArray(payload.keys)) throw new Error('Invalid keys: expected an array');
+    const previousByName = new Map(
+      normalizeClientApiKeys(raw).map((record) => [record.name, record.key]),
+    );
+    next.clientApiKeys = payload.keys.map((entry, index) => {
+      const name = typeof entry?.name === 'string' && entry.name.trim()
+        ? entry.name.trim()
+        : `key-${index + 1}`;
+      const submitted = typeof entry?.key === 'string' ? entry.key.trim() : '';
+      const key = submitted || previousByName.get(name) || '';
+      if (!key) throw new Error(`Missing key value for ${name}`);
+      return {
+        name,
+        key,
+        enabled: entry?.enabled !== false,
+        note: typeof entry?.note === 'string' ? entry.note : '',
+      };
+    });
+    delete next.clientApiKey;
+    return next;
+  } else {
+    throw new Error(`Unknown action: ${action}`);
+  }
+
+  next.groups = groups;
+  next.activeGroups = activeGroups;
+  delete next.activeGroup;
+  return next;
+}
+
+const RANGE_PRESET_DAYS = { '7d': 7, '30d': 30 };
+
+function parseLogFilters(params, now = Date.now()) {
+  const filters = {
+    group: params.get('group') || undefined,
+    model: params.get('model') || undefined,
+    apiKey: params.get('apiKey') || undefined,
+    status: params.get('status') || undefined,
+    cached: params.get('cached') || undefined,
+  };
+
+  const range = params.get('range');
+  if (range === 'today') {
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+    filters.since = start.getTime();
+  } else if (RANGE_PRESET_DAYS[range]) {
+    filters.since = now - RANGE_PRESET_DAYS[range] * 86400000;
+  }
+
+  // An explicit window always wins over the preset.
+  const since = Date.parse(params.get('since'));
+  if (Number.isFinite(since)) filters.since = since;
+  const until = Date.parse(params.get('until'));
+  if (Number.isFinite(until)) filters.until = until;
+
+  return filters;
+}
 
 function renderDashboardHtml() {
   return DASHBOARD_HTML;
@@ -1316,10 +2140,20 @@ function createTerminalProgress(config, options = {}) {
 }
 
 function createProxyServer(rawConfig, options = {}) {
-  const config = validateAndNormalizeConfig(rawConfig);
+  // Dashboard edits swap `config` in place; requestLog and progress keep the settings
+  // they captured at startup, so those sections still need a restart to change.
+  let config = validateAndNormalizeConfig(rawConfig);
+  // A caller may hand over an already-normalized config whose `endpoints` are Sets,
+  // which would otherwise serialize to {} and corrupt the file on the first save.
+  let raw = JSON.parse(JSON.stringify(rawConfig, (key, value) => (
+    value instanceof Set ? [...value] : value
+  )));
+  // Persistence is opt-in: startFromConfig passes the real path, while embedded callers
+  // and tests default to in-memory-only edits.
+  const configFile = typeof options.configFile === 'string' ? options.configFile : null;
   const logOutput = options.log || defaultLog;
   const progress = createTerminalProgress(config, options.progress);
-  const monitor = createMonitorState(config);
+  const monitor = createMonitorState(() => config);
   const requestLog = createRequestLog(config);
   const clientSockets = new Set();
 
@@ -1332,6 +2166,68 @@ function createProxyServer(rawConfig, options = {}) {
     const message = `${formatTime()} DEBUG ${line}`;
     if (progress.isInteractive) progress.print(message);
     else logOutput(message);
+  }
+
+  // Called only when the dashboard explicitly asks, so no upstream traffic at startup.
+  function fetchUpstreamModels(name) {
+    const group = typeof name === 'string' ? config.groups[name] : undefined;
+    if (!group) throw new Error(`Unknown channel: ${name || '<empty>'}`);
+    const upstream = group.upstreams[0];
+    if (!upstream) throw new Error(`Channel ${name} has no upstream`);
+
+    const url = buildUpstreamUrl(upstream.baseUrl, '/models', '');
+    const transport = url.protocol === 'https:' ? https : http;
+    const headers = { accept: 'application/json', 'accept-encoding': 'identity' };
+    if (upstream.apiKey) {
+      if (upstream.authStyle === 'x-api-key') headers['x-api-key'] = upstream.apiKey;
+      else headers.authorization = `Bearer ${upstream.apiKey}`;
+    }
+
+    return new Promise((resolve, reject) => {
+      const upstreamRequest = transport.request(url, { method: 'GET', headers }, (upstreamResponse) => {
+        const status = upstreamResponse.statusCode || 502;
+        const chunks = [];
+        let bytes = 0;
+        upstreamResponse.on('data', (chunk) => {
+          bytes += chunk.length;
+          if (bytes <= 1048576) chunks.push(chunk);
+        });
+        upstreamResponse.once('end', () => {
+          if (status < 200 || status >= 300) {
+            reject(new Error(`Upstream ${name} returned ${status} for /models`));
+            return;
+          }
+          try {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            const list = Array.isArray(parsed) ? parsed : parsed.data;
+            if (!Array.isArray(list)) throw new Error('unexpected payload shape');
+            const ids = list
+              .map((item) => (typeof item === 'string' ? item : item?.id))
+              .filter((id) => typeof id === 'string' && id);
+            resolve([...new Set(ids)].sort());
+          } catch (error) {
+            reject(new Error(`Could not parse ${name} model list: ${error.message}`));
+          }
+        });
+        upstreamResponse.once('error', reject);
+      });
+
+      upstreamRequest.setTimeout(config.timeouts.connectTimeoutMs, () => {
+        upstreamRequest.destroy(new Error(`Timed out fetching ${name} model list`));
+      });
+      upstreamRequest.once('error', reject);
+      upstreamRequest.end();
+    });
+  }
+
+  // Validation runs before the swap so a bad edit leaves the running proxy untouched.
+  async function applyMutation(action, payload) {
+    const candidateRaw = applyConfigMutation(raw, action, payload);
+    const candidate = validateAndNormalizeConfig(candidateRaw);
+    config = candidate;
+    raw = candidateRaw;
+    if (configFile) await writeConfigFile(configFile, raw);
+    return candidate;
   }
 
   const server = http.createServer(async (request, response) => {
@@ -1347,11 +2243,63 @@ function createProxyServer(rawConfig, options = {}) {
         sendJson(response, 403, { error: { message: 'Local access only', type: 'forbidden' } });
         return;
       }
-      if (request.method !== 'GET') {
+      const writePaths = new Set(['/_mini/config', '/_mini/config/models']);
+      const isWrite = request.method === 'POST' && writePaths.has(clientUrl.pathname);
+      if (request.method !== 'GET' && !isWrite) {
         sendJson(response, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
         return;
       }
       response.setHeader('cache-control', 'no-store');
+
+      if (isWrite && !config.webui.enabled) {
+        sendJson(response, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
+        return;
+      }
+
+      if (clientUrl.pathname === '/_mini/config' && request.method === 'GET') {
+        sendJson(response, 200, buildConfigView(raw, config));
+        return;
+      }
+
+      if (isWrite) {
+        let payload;
+        try {
+          const body = await readRequestBody(request);
+          payload = body.length > 0 ? JSON.parse(body.toString('utf8')) : {};
+          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            throw new Error('Expected a JSON object');
+          }
+        } catch (error) {
+          sendJson(response, 400, {
+            error: { message: `Invalid request body: ${error.message}`, type: 'invalid_request_error' },
+          });
+          return;
+        }
+
+        if (clientUrl.pathname === '/_mini/config/models') {
+          try {
+            const models = await fetchUpstreamModels(payload.name);
+            sendJson(response, 200, { name: payload.name, models });
+          } catch (error) {
+            sendJson(response, 502, {
+              error: { message: error.message, type: 'upstream_connection_error' },
+            });
+          }
+          return;
+        }
+
+        try {
+          await applyMutation(payload.action, payload.payload || payload);
+          log(`${formatTime()} config ${payload.action} applied`
+            + ` groups=${config.activeGroups.join(',')}`);
+          sendJson(response, 200, { ok: true, config: buildConfigView(raw, config) });
+        } catch (error) {
+          sendJson(response, 400, {
+            error: { message: error.message, type: 'invalid_request_error' },
+          });
+        }
+        return;
+      }
 
       if (clientUrl.pathname === '/_mini/status') {
         if (!config.monitor.enabled) {
@@ -1367,16 +2315,13 @@ function createProxyServer(rawConfig, options = {}) {
         const rawLimit = Number.parseInt(params.get('limit') || '100', 10);
         sendJson(response, 200, requestLog.query({
           limit: Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : 100,
-          group: params.get('group') || undefined,
-          model: params.get('model') || undefined,
-          status: params.get('status') || undefined,
-          cached: params.get('cached') || undefined,
+          ...parseLogFilters(params),
         }));
         return;
       }
 
       if (clientUrl.pathname === '/_mini/stats') {
-        sendJson(response, 200, requestLog.stats());
+        sendJson(response, 200, requestLog.stats(parseLogFilters(clientUrl.searchParams)));
         return;
       }
 
@@ -1410,7 +2355,8 @@ function createProxyServer(rawConfig, options = {}) {
       return;
     }
 
-    if (!isClientAuthorized(request, config)) {
+    const auth = authorizeClient(request, config);
+    if (!auth.authorized) {
       response.setHeader('www-authenticate', 'Bearer');
       sendJson(response, 401, {
         error: { message: 'Invalid API key', type: 'authentication_error' },
@@ -1464,6 +2410,7 @@ function createProxyServer(rawConfig, options = {}) {
       mappedModel: current.targetModel,
       group: current.group.name,
       upstream: current.upstream.name,
+      apiKeyName: auth.key ? auth.key.name : null,
       status: null,
       requestBytes: rawRequestBytes,
       responseBytes: 0,
@@ -1472,6 +2419,7 @@ function createProxyServer(rawConfig, options = {}) {
       startedAt,
       endedAt: null,
       stream: bodyInfo.stream,
+      reasoningEffort: bodyInfo.reasoningEffort,
       completed: false,
       failed: false,
       usage: null,
@@ -1728,15 +2676,17 @@ function startFromConfig() {
     ? path.resolve(process.env.MINI_CODEX_PROXY_CONFIG)
     : path.join(__dirname, 'config.json');
   let config;
+  let raw;
   try {
-    config = loadConfig(configPath);
+    raw = readRawConfig(configPath);
+    config = validateAndNormalizeConfig(raw);
   } catch (error) {
     process.stderr.write(`Configuration error: ${error.message}\n`);
     process.exitCode = 1;
     return;
   }
 
-  const server = createProxyServer(config);
+  const server = createProxyServer(raw, { configFile: configPath });
   server.on('error', (error) => {
     process.stderr.write(`Proxy error: ${error.message}\n`);
     process.exitCode = 1;
@@ -1770,10 +2720,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  applyConfigMutation,
   buildLocalModelList,
   cacheHitRate,
   createSseObserver,
   normalizeUsage,
+  parseLogFilters,
   usageFromPayload,
   buildUpstreamUrl,
   bodyWithModel,
