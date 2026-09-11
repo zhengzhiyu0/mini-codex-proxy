@@ -1365,6 +1365,54 @@ function toast(message, ok) {
   el.timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
 }
 
+const FILTER_STORAGE_KEY = 'mini-dashboard-filters';
+const FILTER_CONTROL_IDS = ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached', 'statsMode', 'since', 'until'];
+
+function saveFilterState() {
+  const active = document.querySelector('#range button.on');
+  const state = {
+    range: active ? active.dataset.range : '',
+    ...Object.fromEntries(FILTER_CONTROL_IDS.map((id) => [id, $(id).value])),
+  };
+  localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(state));
+}
+
+function restoreFilterState() {
+  const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+  if (!raw) return;
+  let state;
+  try {
+    state = JSON.parse(raw);
+  } catch {
+    localStorage.removeItem(FILTER_STORAGE_KEY);
+    return;
+  }
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    localStorage.removeItem(FILTER_STORAGE_KEY);
+    return;
+  }
+  if (state.range) {
+    const button = document.querySelector('#range button[data-range="' + state.range + '"]');
+    if (button) {
+      for (const b of $('range').children) b.classList.toggle('on', b === button);
+      $('customRange').style.display = state.range === 'custom' ? '' : 'none';
+    }
+  }
+  for (const id of FILTER_CONTROL_IDS) {
+    if (typeof state[id] !== 'string') continue;
+    const select = $(id);
+    if (select.tagName === 'SELECT' && state[id]
+      && ![...select.options].some((option) => option.value === state[id])) {
+      const option = document.createElement('option');
+      option.value = state[id];
+      option.textContent = state[id];
+      select.append(option);
+    }
+    select.value = state[id];
+    select.dataset.restoredValue = state[id];
+  }
+}
+
 function filterQuery() {
   const params = new URLSearchParams();
   const active = document.querySelector('#range button.on');
@@ -1385,9 +1433,14 @@ function filterQuery() {
 
 function fillSelect(select, values, allLabel) {
   const previous = select.value;
+  const restored = select.dataset.restoredValue;
+  const next = restored || previous;
+  const options = values.slice();
+  if (next && !options.includes(next)) options.unshift(next);
   select.innerHTML = ['<option value="">' + (allLabel || '全部') + '</option>']
-    .concat(values.map((v) => '<option value="' + esc(v) + '">' + esc(v) + '</option>')).join('');
-  if (values.includes(previous)) select.value = previous;
+    .concat(options.map((v) => '<option value="' + esc(v) + '">' + esc(v) + '</option>')).join('');
+  if (next) select.value = next;
+  delete select.dataset.restoredValue;
 }
 
 // The mapping editor always targets exactly one channel, so it has no "all" option.
@@ -1686,15 +1739,20 @@ $('range').addEventListener('click', (event) => {
   if (!button) return;
   for (const b of $('range').children) b.classList.toggle('on', b === button);
   $('customRange').style.display = button.dataset.range === 'custom' ? '' : 'none';
+  saveFilterState();
   refresh();
 });
 
-for (const id of ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached', 'statsMode', 'since', 'until']) {
-  $(id).addEventListener('change', refresh);
+for (const id of FILTER_CONTROL_IDS) {
+  $(id).addEventListener('change', () => {
+    saveFilterState();
+    refresh();
+  });
 }
 
 $('reset').addEventListener('click', () => {
   for (const id of ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached']) $(id).value = '';
+  saveFilterState();
   refresh();
 });
 
@@ -1784,6 +1842,8 @@ $('saveKeys').addEventListener('click', () => {
   const keys = readKeyDraft().filter((k) => k.name || k.key);
   mutate('saveClientKeys', { keys }, 'API Key 已保存并生效');
 });
+
+restoreFilterState();
 
 function loop() {
   clearInterval(timer);
