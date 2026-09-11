@@ -487,8 +487,8 @@ GET /_mini/requests?since=2026-03-01T00:00:00Z&until=2026-03-07T23:59:59Z
   "pricing": {
     "currency": "USD",
     "models": {
-      "claude-opus-5": { "input": 15, "output": 75 },
-      "claude-sonnet*": { "input": 3, "output": 15 }
+      "claude-opus-5": { "input": 5, "output": 25, "cacheRead": 0.5, "cacheWrite": 6.25 },
+      "claude-sonnet*": { "input": 2, "output": 10 }
     }
   }
 }
@@ -498,7 +498,7 @@ GET /_mini/requests?since=2026-03-01T00:00:00Z&until=2026-03-07T23:59:59Z
 - 键里含 `*` 时按前缀匹配，例如 `claude-sonnet*` 能命中 `claude-sonnet-5`
 - 精确匹配优先于前缀匹配；匹配时先看实际转发的上游模型名，再看客户端请求的别名
 - `input` / `output` 至少要填一个；`cacheRead` / `cacheWrite` 不填时默认取输入价的 `0.1` / `1.25` 倍，倍率可用 `pricing.cacheReadMultiplier`、`pricing.cacheWriteMultiplier` 调整
-- 内置默认表覆盖 `claude-opus-5`、`claude-fable-5`、`claude-sonnet-5`、`claude-haiku-4.5`、`gpt-6-astra`、`gpt-5.6-sol/terra/luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`grok-4.6`、`grok-4.5`。**这些数值是按模型档位估算的，不是上游账单，请按自己的实际价格核对后改 `config.json`**
+- 内置默认表按 2026-09 的各家官方牌价填写（claude 系含缓存读写价，其中 `cacheWrite` 按 5 分钟 TTL 档；日志没有区分 5m/1h 写入，如有 1h 缓存写入会按 5m 价低估，可自行调大 `cacheWrite`）。`gpt-5.6-sol` 按牌价 $5/$30 填写，厂商有限时促销价（输出 $20），按促销价对账时自行修改
 
 计算方式：
 

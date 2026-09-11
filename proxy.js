@@ -837,19 +837,23 @@ function cacheHitRate(usage) {
 const PRICING_UNIT = 1000000;
 
 const DEFAULT_PRICING = {
-  'claude-opus-5': { input: 15, output: 75 },
-  'claude-fable-5': { input: 5, output: 25 },
-  'claude-sonnet-5': { input: 3, output: 15 },
-  'claude-haiku-4.5': { input: 1, output: 5 },
-  'gpt-6-astra': { input: 5, output: 20 },
-  'gpt-5.6-sol': { input: 2.5, output: 15 },
-  'gpt-5.6-terra': { input: 2.5, output: 15 },
-  'gpt-5.6-luna': { input: 1, output: 6 },
-  'gpt-5.5': { input: 2.5, output: 15 },
-  'gpt-5.4': { input: 2, output: 12 },
-  'gpt-5.4-mini': { input: 0.5, output: 3 },
-  'grok-4.6': { input: 3, output: 15 },
-  'grok-4.5': { input: 2.5, output: 12 },
+  // Anthropic list prices; cacheWrite is the 5m TTL rate (1h writes cannot be
+  // distinguished in the log's single cacheWriteTokens bucket).
+  'claude-opus-5': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+  'claude-fable-5': { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+  'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+  'claude-haiku-4.5': { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+  // OpenAI list prices; cached input is 0.1x input across the lineup.
+  'gpt-6-astra': { input: 10, output: 50, cacheRead: 1 },
+  'gpt-5.6-sol': { input: 5, output: 30, cacheRead: 0.5 },
+  'gpt-5.6-terra': { input: 2, output: 12, cacheRead: 0.2 },
+  'gpt-5.6-luna': { input: 0.2, output: 1.2, cacheRead: 0.02 },
+  'gpt-5.5': { input: 5, output: 30, cacheRead: 0.5 },
+  'gpt-5.4': { input: 2.5, output: 15, cacheRead: 0.25 },
+  'gpt-5.4-mini': { input: 0.75, output: 4.5, cacheRead: 0.075 },
+  // xAI; cache read is a flat $0.30 rather than a ratio of the input price.
+  'grok-4.6': { input: 2, output: 6, cacheRead: 0.3 },
+  'grok-4.5': { input: 2, output: 6, cacheRead: 0.3 },
 };
 
 function normalizePriceSpec(name, entry) {

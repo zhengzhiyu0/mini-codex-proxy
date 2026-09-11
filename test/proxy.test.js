@@ -1449,7 +1449,7 @@ test('config pricing overrides built-ins, supports prefix wildcards, and prefers
   assert.equal(pricing.currency, 'CNY');
   assert.equal(proxy.matchPrice(pricing, 'claude-opus-5').input, 1);
   // Models the overlay does not mention keep their built-in rate.
-  assert.equal(proxy.matchPrice(pricing, 'claude-sonnet-5').input, 3);
+  assert.equal(proxy.matchPrice(pricing, 'claude-sonnet-5').input, 2);
   assert.equal(proxy.matchPrice(pricing, 'acme-pro-2').output, 8);
   assert.equal(proxy.matchPrice(pricing, 'nothing-known'), null);
 
@@ -1472,7 +1472,7 @@ test('unpriced models and missing usage report null cost rather than zero', () =
   assert.equal(totals.requests, 2);
   assert.equal(totals.pricedRequests, 1);
   assert.equal(totals.unpricedRequests, 1);
-  assert.equal(totals.cost, 15);
+  assert.equal(totals.cost, 5);
 });
 
 test('invalid pricing entries are rejected while loading config', () => {
