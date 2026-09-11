@@ -1160,7 +1160,7 @@ table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 th{color:var(--dim);font-weight:400;font-size:11px}
 tbody tr:last-child td{border-bottom:0}
-td.n{text-align:right}
+.n{text-align:right}
 .s-ok{color:var(--ok)}.s-bad{color:var(--bad)}.s-run{color:var(--warm)}
 .hit{color:var(--cool)}.dim{color:var(--dim)}
 .wrap{max-height:420px;overflow:auto}
