@@ -1,0 +1,20 @@
+README.md
+  h_49201e0a695903 490-491,501
+config.example.json
+  h_49201e0a695903 97-99
+proxy.js
+  h_49201e0a695903 840-856
+test/proxy.test.js
+  h_49201e0a695903 1452,1475
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c9f0b1e478844aefede80dd555425fbc03e0befb",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
