@@ -1557,6 +1557,16 @@ const pct = (v) => (v == null ? '-' : (v * 100).toFixed(1) + '%');
 const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
 ));
+// Request log timestamps are stored as UTC ISO; show them in China time (UTC+8).
+const CST_TIME = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+});
+const cstTime = (iso) => {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? CST_TIME.format(t).slice(5) : '-';
+};
 
 let currency = 'USD';
 let logPage = 1;
@@ -1748,7 +1758,7 @@ function renderLog(data) {
   $('log').innerHTML = rows.length ? rows.map((e) => {
     const u = e.usage || {};
     return '<tr>'
-      + '<td class="dim">' + esc(e.at.slice(5, 19).replace('T', ' ')) + '</td>'
+      + '<td class="dim">' + esc(cstTime(e.at)) + '</td>'
       + '<td>' + esc(e.model || e.mappedModel || '-') + '</td>'
       + '<td>' + esc(e.reasoningEffort || '-') + '</td>'
       + '<td>' + esc(e.group || '-') + '</td>'
