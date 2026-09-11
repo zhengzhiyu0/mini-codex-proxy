@@ -788,14 +788,17 @@ function normalizeUsage(usage) {
   const num = (value) => (Number.isFinite(value) && value >= 0 ? value : 0);
   const cacheRead = num(usage.cache_read_input_tokens);
   const cacheWrite = num(usage.cache_creation_input_tokens);
+  // 只有明确表示「prompt cache read」的字段才算缓存输入。
   const openAiCached = num(usage.prompt_tokens_details?.cached_tokens)
-    || num(usage.input_tokens_details?.cached_tokens);
+    || num(usage.input_tokens_details?.cached_tokens)
+    || num(usage.prompt_cache_hit_tokens);
   const rawInput = num(usage.prompt_tokens) || num(usage.input_tokens);
   const outputTokens = num(usage.completion_tokens) || num(usage.output_tokens);
 
   const anthropicStyle = cacheRead > 0 || cacheWrite > 0;
   const promptTokens = anthropicStyle ? rawInput + cacheRead + cacheWrite : rawInput;
-  const cacheReadTokens = anthropicStyle ? cacheRead : openAiCached;
+  // 缓存桶是 prompt 的子集：上游返回异常数据时，不能计出比 prompt 还多的缓存 token。
+  const cacheReadTokens = Math.min(anthropicStyle ? cacheRead : openAiCached, promptTokens);
 
   if (promptTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWrite === 0) {
     return null;
@@ -851,8 +854,15 @@ const DEFAULT_PRICING = {
   'gpt-5.5': { input: 5, output: 30, cacheRead: 0.5 },
   'gpt-5.4': { input: 2.5, output: 15, cacheRead: 0.25 },
   'gpt-5.4-mini': { input: 0.75, output: 4.5, cacheRead: 0.075 },
+  // xAI grok-4.6 牌价。prompt 达到 200k token 的请求，整条输入与输出都按长上下文档计价；
+  // 缓存 token 始终走自己的缓存读价，不按普通输入价计。
+  'grok-4.6': {
+    input: 2,
+    output: 6,
+    cacheRead: 0.5,
+    longContext: { threshold: 200000, input: 4, output: 12, cacheRead: 1 },
+  },
   // xAI; cache read is a flat $0.30 rather than a ratio of the input price.
-  'grok-4.6': { input: 2, output: 6, cacheRead: 0.3 },
   'grok-4.5': { input: 2, output: 6, cacheRead: 0.3 },
 };
 
@@ -873,12 +883,25 @@ function normalizePriceSpec(name, entry) {
   if (input === null && output === null) {
     throw new Error(`pricing.models["${name}"] needs an "input" or "output" price`);
   }
-  return {
+  const spec = {
     input: input ?? 0,
     output: output ?? 0,
     cacheRead: price('cacheRead'),
     cacheWrite: price('cacheWrite'),
+    longContext: null,
   };
+  if (entry.longContext !== undefined && entry.longContext !== null) {
+    const tier = entry.longContext;
+    if (!tier || typeof tier !== 'object' || Array.isArray(tier)) {
+      throw new Error(`pricing.models["${name}"].longContext must be an object`);
+    }
+    const threshold = tier.threshold;
+    if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < 0) {
+      throw new Error(`pricing.models["${name}"].longContext.threshold must be a non-negative number`);
+    }
+    spec.longContext = { threshold, ...normalizePriceSpec(`${name}.longContext`, tier) };
+  }
+  return spec;
 }
 
 // The built-in table is the baseline; config.json overlays named models and may add
@@ -895,7 +918,7 @@ function normalizePricing(input) {
 
   const models = {};
   for (const [name, entry] of Object.entries(DEFAULT_PRICING)) {
-    models[name] = { cacheRead: null, cacheWrite: null, ...entry };
+    models[name] = normalizePriceSpec(name, entry);
   }
   for (const [name, entry] of Object.entries(overrides)) {
     const key = name.trim();
@@ -941,18 +964,35 @@ function matchPrice(pricing, model) {
   return best;
 }
 
+// 单价可以带长上下文阶梯。选档只看本请求自己的 prompt 大小，
+// 所以同一模型的不同请求可以落在不同档位。
+function specForPrompt(spec, promptTokens) {
+  const tier = spec.longContext;
+  return tier && promptTokens >= tier.threshold ? tier : spec;
+}
+
+function rateOf(spec, pricing) {
+  return {
+    input: spec.input,
+    output: spec.output,
+    cacheRead: spec.cacheRead ?? spec.input * pricing.cacheReadMultiplier,
+    cacheWrite: spec.cacheWrite ?? spec.input * pricing.cacheWriteMultiplier,
+  };
+}
+
 function entryCost(usage, spec, pricing) {
   if (!usage || !spec) return null;
-  const cacheReadTokens = usage.cacheReadTokens || 0;
-  const cacheWriteTokens = usage.cacheWriteTokens || 0;
-  // promptTokens already counts both cache buckets, so back them out to price them separately.
-  const inputTokens = Math.max(0, usage.promptTokens - cacheReadTokens - cacheWriteTokens);
-  const cacheReadPrice = spec.cacheRead ?? spec.input * pricing.cacheReadMultiplier;
-  const cacheWritePrice = spec.cacheWrite ?? spec.input * pricing.cacheWriteMultiplier;
-  const total = inputTokens * spec.input
-    + cacheReadTokens * cacheReadPrice
-    + cacheWriteTokens * cacheWritePrice
-    + (usage.outputTokens || 0) * spec.output;
+  const promptTokens = Math.max(0, usage.promptTokens || 0);
+  // 缓存桶属于 prompt 的一部分，不是额外 token：不减掉它们，缓存输入会既按缓存价、
+  // 又按普通输入价被计两次。
+  const cacheWriteTokens = Math.min(usage.cacheWriteTokens || 0, promptTokens);
+  const cacheReadTokens = Math.min(usage.cacheReadTokens || 0, promptTokens - cacheWriteTokens);
+  const inputTokens = promptTokens - cacheWriteTokens - cacheReadTokens;
+  const rate = rateOf(specForPrompt(spec, promptTokens), pricing);
+  const total = inputTokens * rate.input
+    + cacheReadTokens * rate.cacheRead
+    + cacheWriteTokens * rate.cacheWrite
+    + (usage.outputTokens || 0) * rate.output;
   return total / pricing.unit;
 }
 

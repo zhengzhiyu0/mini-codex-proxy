@@ -498,15 +498,36 @@ GET /_mini/requests?since=2026-03-01T00:00:00Z&until=2026-03-07T23:59:59Z
 - 键里含 `*` 时按前缀匹配，例如 `claude-sonnet*` 能命中 `claude-sonnet-5`
 - 精确匹配优先于前缀匹配；匹配时先看实际转发的上游模型名，再看客户端请求的别名
 - `input` / `output` 至少要填一个；`cacheRead` / `cacheWrite` 不填时默认取输入价的 `0.1` / `1.25` 倍，倍率可用 `pricing.cacheReadMultiplier`、`pricing.cacheWriteMultiplier` 调整
-- 内置默认表按 2026-09 的各家官方牌价填写（claude 系含缓存读写价，其中 `cacheWrite` 按 5 分钟 TTL 档；日志没有区分 5m/1h 写入，如有 1h 缓存写入会按 5m 价低估，可自行调大 `cacheWrite`）。`gpt-5.6-sol` 按牌价 $5/$30 填写，厂商有限时促销价（输出 $20），按促销价对账时自行修改
+- 长上下文阶梯写在 `longContext` 里，必须给出 `threshold`；本次请求的输入总量（`promptTokens`，含缓存读/写）达到 `threshold` 时，整条请求的输入与输出都改用这一档的价，否则用基础档：
+
+```json
+{
+  "pricing": {
+    "models": {
+      "grok-4.6": {
+        "input": 2,
+        "output": 6,
+        "cacheRead": 0.5,
+        "longContext": { "threshold": 200000, "input": 4, "output": 12, "cacheRead": 1 }
+      }
+    }
+  }
+}
+```
+
+- 内置默认表按 2026-09 的各家官方牌价填写（claude 系含缓存读写价，其中 `cacheWrite` 按 5 分钟 TTL 档；日志没有区分 5m/1h 写入，如有 1h 缓存写入会按 5m 价低估，可自行调大 `cacheWrite`）。`gpt-5.6-sol` 按牌价 $5/$30 填写，厂商有限时促销价（输出 $20），按促销价对账时自行修改。`grok-4.6` 按牌价 $2/$6、缓存读 $0.50 填写，200k 以上长上下文档为 $4/$12、缓存读 $1（`grok-4.5` 的缓存读价暂未按官方牌价核实）
 
 计算方式：
 
 ```text
-费用 = 非缓存输入 × input + 缓存读 × cacheRead + 缓存写 × cacheWrite + 输出 × output
+档位 = promptTokens >= longContext.threshold ? longContext : 基础档
+费用 = 非缓存输入 × 档位.input
+     + 缓存读 × 档位.cacheRead
+     + 缓存写 × 档位.cacheWrite
+     + 输出 × 档位.output
 ```
 
-`promptTokens` 已经把缓存读和缓存写算在内，计费时会先减掉这两项，避免重复计费。模型查不到单价时该请求记为「未定价」，面板上显示 `未定价` / `+N 未定价`，不并入金额。
+`promptTokens` 已经把缓存读和缓存写算在内，计费时会先减掉这两项，缓存读只按 `cacheRead` 计价一次，不会再按普通输入价重复计费。每条请求各自选档、各自算价，再把金额累加；内部金额用原始整数 token 计算，面板展示时才四舍五入。模型查不到单价时该请求记为「未定价」，面板上显示 `未定价` / `+N 未定价`，不并入金额。
 
 ## WebUI 面板
 

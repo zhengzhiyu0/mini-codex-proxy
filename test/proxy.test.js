@@ -1475,6 +1475,230 @@ test('unpriced models and missing usage report null cost rather than zero', () =
   assert.equal(totals.cost, 5);
 });
 
+const MILLION = 1e6;
+
+function assertClose(actual, expected, label) {
+  assert.ok(Math.abs(actual - expected) < 1e-9, `${label}：期望 ${expected}，实际 ${actual}`);
+}
+
+// 按面板的口径结算单条请求，并报出四个费用分量，让每个用例都写清缓存输入与普通输入
+// 是怎么拆的。期望值一律写成字面算式、不从 proxy.js 反推；但 total_cost 仍取自生产代码，
+// 所以 entryCost 一旦走样用例就会失败。
+function bill(t, model, usage, expected) {
+  const pricing = proxy.normalizePricing({ models: {} });
+  const normalized = normalizeUsage(usage);
+  const spec = proxy.matchPrice(pricing, model);
+  const rate = spec.longContext && normalized.promptTokens >= spec.longContext.threshold
+    ? spec.longContext
+    : spec;
+  const inputTokens = normalized.promptTokens
+    - normalized.cacheReadTokens
+    - normalized.cacheWriteTokens;
+  const actual = {
+    input_cost: inputTokens * rate.input / MILLION,
+    cached_input_cost: normalized.cacheReadTokens * rate.cacheRead / MILLION,
+    output_cost: normalized.outputTokens * rate.output / MILLION,
+    total_cost: proxy.costOfEntry({ model, usage: normalized }, pricing),
+  };
+  t.diagnostic(`${model} prompt=${normalized.promptTokens}`
+    + ` cached=${normalized.cacheReadTokens} output=${normalized.outputTokens}`
+    + ` -> input_cost=${actual.input_cost} cached_input_cost=${actual.cached_input_cost}`
+    + ` output_cost=${actual.output_cost} total_cost=${actual.total_cost}`);
+  for (const [key, value] of Object.entries(expected)) {
+    assertClose(actual[key], value, `${model} ${key}`);
+  }
+  return normalized;
+}
+
+test('grok-4.6 普通上下文、无缓存：只计普通输入与输出', (t) => {
+  bill(t, 'grok-4.6', { prompt_tokens: 100000, completion_tokens: 500 }, {
+    input_cost: 100000 * 2 / MILLION,
+    cached_input_cost: 0,
+    output_cost: 500 * 6 / MILLION,
+    total_cost: 0.203,
+  });
+});
+
+test('grok-4.6 普通上下文：缓存读按 $0.50、其余输入按 $2', (t) => {
+  bill(t, 'grok-4.6', {
+    prompt_tokens: 100000,
+    completion_tokens: 500,
+    prompt_tokens_details: { cached_tokens: 80000 },
+  }, {
+    input_cost: 20000 * 2 / MILLION,
+    cached_input_cost: 80000 * 0.5 / MILLION,
+    output_cost: 500 * 6 / MILLION,
+    total_cost: 0.083,
+  });
+
+  // 同样的拆分也可能由厂商专属的缓存字段名给出。
+  bill(t, 'grok-4.6', {
+    prompt_tokens: 100000,
+    completion_tokens: 0,
+    prompt_cache_hit_tokens: 80000,
+  }, {
+    input_cost: 20000 * 2 / MILLION,
+    cached_input_cost: 80000 * 0.5 / MILLION,
+    output_cost: 0,
+    total_cost: 0.08,
+  });
+});
+
+test('grok-4.6 长上下文、无缓存：整条请求切到 $4 / $12 档', (t) => {
+  bill(t, 'grok-4.6', { prompt_tokens: 250000, completion_tokens: 100 }, {
+    input_cost: 250000 * 4 / MILLION,
+    cached_input_cost: 0,
+    output_cost: 100 * 12 / MILLION,
+    total_cost: 1.0012,
+  });
+});
+
+test('grok-4.6 长上下文：缓存读按 $1、其余输入按 $4', (t) => {
+  bill(t, 'grok-4.6', {
+    prompt_tokens: 300000,
+    completion_tokens: 1000,
+    prompt_tokens_details: { cached_tokens: 250000 },
+  }, {
+    input_cost: 50000 * 4 / MILLION,
+    cached_input_cost: 250000 * 1 / MILLION,
+    output_cost: 1000 * 12 / MILLION,
+    total_cost: 0.462,
+  });
+});
+
+test('grok-4.6 长上下文：缓存读几乎覆盖整个 prompt', (t) => {
+  bill(t, 'grok-4.6', {
+    prompt_tokens: 250000,
+    completion_tokens: 10,
+    prompt_tokens_details: { cached_tokens: 249000 },
+  }, {
+    input_cost: 1000 * 4 / MILLION,
+    cached_input_cost: 249000 * 1 / MILLION,
+    output_cost: 10 * 12 / MILLION,
+    total_cost: 0.25312,
+  });
+});
+
+test('grok-4.6 上游未返回 cached token 时，整个 prompt 按普通输入计价', (t) => {
+  const usage = bill(t, 'grok-4.6', {
+    prompt_tokens: 200000,
+    completion_tokens: 0,
+    prompt_tokens_details: { cached_tokens: 0 },
+  }, {
+    input_cost: 200000 * 4 / MILLION,
+    cached_input_cost: 0,
+    output_cost: 0,
+    total_cost: 0.8,
+  });
+  assert.equal(usage.cacheReadTokens, 0);
+});
+
+test('grok-4.6 在正好 200,000 个 prompt token 处切换档位', (t) => {
+  bill(t, 'grok-4.6', { prompt_tokens: 199999, completion_tokens: 0 }, {
+    input_cost: 199999 * 2 / MILLION,
+    cached_input_cost: 0,
+    output_cost: 0,
+    total_cost: 0.399998,
+  });
+  bill(t, 'grok-4.6', { prompt_tokens: 200000, completion_tokens: 0 }, {
+    input_cost: 200000 * 4 / MILLION,
+    cached_input_cost: 0,
+    output_cost: 0,
+    total_cost: 0.8,
+  });
+});
+
+test('grok-4.6 多条请求各自计价后再累加', () => {
+  const pricing = proxy.normalizePricing({ models: {} });
+  const entries = [
+    {
+      model: 'grok-4.6',
+      usage: normalizeUsage({
+        prompt_tokens: 554000,
+        completion_tokens: 3490,
+        prompt_tokens_details: { cached_tokens: 536000 },
+      }),
+    },
+    {
+      model: 'grok-4.6',
+      usage: normalizeUsage({ prompt_tokens: 1000, completion_tokens: 100 }),
+    },
+  ];
+  const totals = proxy.summarizeUsage(entries, pricing);
+  assert.equal(totals.requests, 2);
+  assert.equal(totals.pricedRequests, 2);
+  assert.equal(totals.unpricedRequests, 0);
+  assertClose(totals.cost, 0.64988 + (1000 * 2 + 100 * 6) / MILLION, '累加费用');
+  // 把两条请求并成一组、按单一价算，会漏掉长上下文那条的高档价。
+  assertClose(totals.cost, 0.65248, '单一价汇总');
+});
+
+test('554k / 536k / 3.49k 这条 grok-4.6 请求计费 $0.64988', (t) => {
+  const usage = bill(t, 'grok-4.6', {
+    prompt_tokens: 554000,
+    completion_tokens: 3490,
+    prompt_tokens_details: { cached_tokens: 536000 },
+  }, {
+    input_cost: 18000 * 4 / MILLION,
+    cached_input_cost: 536000 * 1 / MILLION,
+    output_cost: 3490 * 12 / MILLION,
+    total_cost: 0.64988,
+  });
+  assert.equal(usage.promptTokens, 554000);
+  assert.equal(usage.cacheReadTokens, 536000);
+  assert.equal((usage.promptTokens - usage.cacheReadTokens), 18000);
+  // 面板把命中率保留一位小数，所以 96.75% 显示成 96.8%。
+  assert.equal((cacheHitRate(usage) * 100).toFixed(1), '96.8');
+});
+
+test('缓存桶大于 prompt 时被钳制，不会重复计费', () => {
+  const usage = normalizeUsage({
+    prompt_tokens: 1000,
+    completion_tokens: 0,
+    prompt_tokens_details: { cached_tokens: 5000 },
+  });
+  assert.equal(usage.cacheReadTokens, 1000);
+  const pricing = proxy.normalizePricing({ models: {} });
+  assertClose(
+    proxy.costOfEntry({ model: 'grok-4.6', usage }, pricing),
+    1000 * 0.5 / MILLION,
+    '钳制后费用',
+  );
+});
+
+test('longContext 阶梯在加载配置时校验', () => {
+  const pricing = proxy.normalizePricing({
+    models: {
+      'tiered-*': {
+        input: 1,
+        output: 2,
+        longContext: { threshold: 100, input: 3, output: 4, cacheRead: 0.5 },
+      },
+    },
+  });
+  const spec = proxy.matchPrice(pricing, 'tiered-pro');
+  assert.equal(spec.input, 1);
+  assert.equal(spec.longContext.threshold, 100);
+  assert.equal(spec.longContext.input, 3);
+  assert.equal(spec.longContext.cacheRead, 0.5);
+  assert.equal(spec.longContext.longContext, null);
+  // 没有配阶梯的模型，任何 prompt 大小都走基础档。
+  assert.equal(proxy.matchPrice(pricing, 'claude-opus-5').longContext, null);
+
+  assert.throws(
+    () => proxy.normalizePricing({ models: { x: { input: 1, longContext: { input: 2 } } } }),
+    /longContext\.threshold/,
+  );
+  assert.throws(
+    () => proxy.normalizePricing({ models: { x: { input: 1, longContext: [] } } }),
+    /longContext must be an object/,
+  );
+  assert.throws(
+    () => proxy.normalizePricing({ models: { x: { input: 1, longContext: { threshold: -1, input: 2 } } } }),
+    /longContext\.threshold/,
+  );
+});
+
 test('invalid pricing entries are rejected while loading config', () => {
   const base = {
     host: '127.0.0.1',
