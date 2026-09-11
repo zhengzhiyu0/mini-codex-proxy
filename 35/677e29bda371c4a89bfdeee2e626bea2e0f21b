@@ -1,0 +1,24 @@
+disable-autostart.cmd
+  h_49201e0a695903 1-14
+disable-autostart.ps1
+  h_49201e0a695903 1-18
+enable-autostart.cmd
+  h_49201e0a695903 1-14
+enable-autostart.ps1
+  h_49201e0a695903 1-25
+proxy.js
+  h_49201e0a695903 1163
+start-proxy-silent.vbs
+  h_49201e0a695903 1-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "35677e29bda371c4a89bfdeee2e626bea2e0f21b",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
