@@ -417,6 +417,7 @@ function validateAndNormalizeConfig(input) {
   }
 
   const clientApiKeys = normalizeClientApiKeys(input);
+  const pricing = normalizePricing(input.pricing);
 
   const config = {
     host: host.trim(),
@@ -425,6 +426,7 @@ function validateAndNormalizeConfig(input) {
     activeGroups,
     routes,
     clientApiKeys,
+    pricing,
     forwardClientAuthorization: input.forwardClientAuthorization === true,
     logging: { enabled: input.logging?.enabled !== false },
     progress: {
@@ -830,6 +832,133 @@ function cacheHitRate(usage) {
   return usage.cacheReadTokens / usage.promptTokens;
 }
 
+// Prices are quoted the way providers publish them: currency units per million tokens.
+// A model key containing `*` acts as a prefix rule for models the table does not name yet.
+const PRICING_UNIT = 1000000;
+
+const DEFAULT_PRICING = {
+  'claude-opus-5': { input: 15, output: 75 },
+  'claude-fable-5': { input: 5, output: 25 },
+  'claude-sonnet-5': { input: 3, output: 15 },
+  'claude-haiku-4.5': { input: 1, output: 5 },
+  'gpt-6-astra': { input: 5, output: 20 },
+  'gpt-5.6-sol': { input: 2.5, output: 15 },
+  'gpt-5.6-terra': { input: 2.5, output: 15 },
+  'gpt-5.6-luna': { input: 1, output: 6 },
+  'gpt-5.5': { input: 2.5, output: 15 },
+  'gpt-5.4': { input: 2, output: 12 },
+  'gpt-5.4-mini': { input: 0.5, output: 3 },
+  'grok-4.6': { input: 3, output: 15 },
+  'grok-4.5': { input: 2.5, output: 12 },
+};
+
+function normalizePriceSpec(name, entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`pricing.models["${name}"] must be an object like {"input":3,"output":15}`);
+  }
+  const price = (key) => {
+    const value = entry[key];
+    if (value === undefined) return null;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new Error(`Invalid pricing.models["${name}"].${key}`);
+    }
+    return value;
+  };
+  const input = price('input');
+  const output = price('output');
+  if (input === null && output === null) {
+    throw new Error(`pricing.models["${name}"] needs an "input" or "output" price`);
+  }
+  return {
+    input: input ?? 0,
+    output: output ?? 0,
+    cacheRead: price('cacheRead'),
+    cacheWrite: price('cacheWrite'),
+  };
+}
+
+// The built-in table is the baseline; config.json overlays named models and may add
+// wildcard keys of its own. Unknown models stay unpriced instead of guessing a rate.
+function normalizePricing(input) {
+  if (input !== undefined && (!input || typeof input !== 'object' || Array.isArray(input))) {
+    throw new Error('Invalid pricing');
+  }
+  const source = input || {};
+  const overrides = source.models === undefined ? {} : source.models;
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    throw new Error('Invalid pricing.models');
+  }
+
+  const models = {};
+  for (const [name, entry] of Object.entries(DEFAULT_PRICING)) {
+    models[name] = { cacheRead: null, cacheWrite: null, ...entry };
+  }
+  for (const [name, entry] of Object.entries(overrides)) {
+    const key = name.trim();
+    if (!key) throw new Error('pricing.models keys must not be empty');
+    models[key] = normalizePriceSpec(key, entry);
+  }
+
+  const multiplier = (value, fallback, field) => {
+    if (value === undefined) return fallback;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new Error(`Invalid pricing.${field}`);
+    }
+    return value;
+  };
+
+  return {
+    currency: typeof source.currency === 'string' && source.currency.trim()
+      ? source.currency.trim()
+      : 'USD',
+    unit: PRICING_UNIT,
+    cacheReadMultiplier: multiplier(source.cacheReadMultiplier, 0.1, 'cacheReadMultiplier'),
+    cacheWriteMultiplier: multiplier(source.cacheWriteMultiplier, 1.25, 'cacheWriteMultiplier'),
+    models,
+  };
+}
+
+// Exact matches win; otherwise the most specific `prefix*` key applies.
+function matchPrice(pricing, model) {
+  if (!pricing || !model) return null;
+  const exact = pricing.models[model];
+  if (exact) return exact;
+  let best = null;
+  let bestPrefix = -1;
+  for (const [pattern, spec] of Object.entries(pricing.models)) {
+    const star = pattern.indexOf('*');
+    if (star === -1) continue;
+    const prefix = pattern.slice(0, star);
+    if (prefix.length > bestPrefix && model.startsWith(prefix)) {
+      best = spec;
+      bestPrefix = prefix.length;
+    }
+  }
+  return best;
+}
+
+function entryCost(usage, spec, pricing) {
+  if (!usage || !spec) return null;
+  const cacheReadTokens = usage.cacheReadTokens || 0;
+  const cacheWriteTokens = usage.cacheWriteTokens || 0;
+  // promptTokens already counts both cache buckets, so back them out to price them separately.
+  const inputTokens = Math.max(0, usage.promptTokens - cacheReadTokens - cacheWriteTokens);
+  const cacheReadPrice = spec.cacheRead ?? spec.input * pricing.cacheReadMultiplier;
+  const cacheWritePrice = spec.cacheWrite ?? spec.input * pricing.cacheWriteMultiplier;
+  const total = inputTokens * spec.input
+    + cacheReadTokens * cacheReadPrice
+    + cacheWriteTokens * cacheWritePrice
+    + (usage.outputTokens || 0) * spec.output;
+  return total / pricing.unit;
+}
+
+// The upstream model is what the provider bills for, so it wins over the client alias.
+function costOfEntry(entry, pricing) {
+  if (!entry.usage) return null;
+  const spec = matchPrice(pricing, entry.mappedModel) || matchPrice(pricing, entry.model);
+  return entryCost(entry.usage, spec, pricing);
+}
+
 const SSE_TEXT_DELTA = /"type"\s*:\s*"(?:response\.output_text\.delta|text_delta)"/;
 
 function createSseObserver() {
@@ -889,13 +1018,16 @@ function createSseObserver() {
   };
 }
 
-function summarizeUsage(entries) {
+function summarizeUsage(entries, pricing) {
   const totals = {
     requests: 0,
     promptTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    cost: 0,
+    pricedRequests: 0,
+    unpricedRequests: 0,
   };
   for (const entry of entries) {
     if (!entry.usage) continue;
@@ -904,6 +1036,13 @@ function summarizeUsage(entries) {
     totals.outputTokens += entry.usage.outputTokens;
     totals.cacheReadTokens += entry.usage.cacheReadTokens;
     totals.cacheWriteTokens += entry.usage.cacheWriteTokens;
+    const cost = costOfEntry(entry, pricing);
+    if (cost === null) {
+      totals.unpricedRequests += 1;
+    } else {
+      totals.cost += cost;
+      totals.pricedRequests += 1;
+    }
   }
   return {
     ...totals,
@@ -992,7 +1131,7 @@ function readHistorySince(file, sinceMs) {
   }
 }
 
-function createRequestLog(config) {
+function createRequestLog(config, getPricing = () => config.pricing) {
   const limit = config.requestLog.limit;
   const file = config.requestLog.file;
   const loaded = loadRequestLogFile(file, limit);
@@ -1087,17 +1226,27 @@ function createRequestLog(config) {
       });
       return { total, matched };
     },
-    query({ limit: max = 100, ...filters } = {}) {
+    query({ limit: max = 100, offset = 0, ...filters } = {}) {
       const { total, matched } = this.select(filters);
+      const pricing = getPricing();
+      const start = Math.min(Math.max(offset, 0), matched.length);
       return {
         total,
         matched: matched.length,
-        totals: summarizeUsage(matched),
-        entries: matched.slice(0, max),
+        offset: start,
+        limit: max,
+        currency: pricing.currency,
+        totals: summarizeUsage(matched, pricing),
+        // cost is derived on read so a price edit re-prices the whole history.
+        entries: matched.slice(start, start + max).map((entry) => ({
+          ...entry,
+          cost: costOfEntry(entry, pricing),
+        })),
       };
     },
     stats(filters = {}) {
       const { matched } = this.select(filters);
+      const pricing = getPricing();
       const byGroup = {};
       const byModel = {};
       const byApiKey = {};
@@ -1110,11 +1259,12 @@ function createRequestLog(config) {
         Object.entries(source).map(([key, list]) => [key, {
           requests: list.length,
           failed: list.filter((entry) => entry.failed).length,
-          ...summarizeUsage(list),
+          ...summarizeUsage(list, pricing),
         }]),
       );
       return {
-        overall: { requests: matched.length, ...summarizeUsage(matched) },
+        currency: pricing.currency,
+        overall: { requests: matched.length, ...summarizeUsage(matched, pricing) },
         byGroup: shape(byGroup),
         byModel: shape(byModel),
         byApiKey: shape(byApiKey),
@@ -1149,6 +1299,7 @@ main{padding:18px;display:grid;gap:18px}
 .card b{display:block;font-size:11px;color:var(--dim);font-weight:400;text-transform:uppercase;
 letter-spacing:.6px;margin-bottom:6px}
 .card span{font-size:20px;font-variant-numeric:tabular-nums}
+.card .sub{font-size:11px;color:var(--dim);margin-left:5px}
 .bar{height:6px;border-radius:3px;background:var(--line);margin-top:8px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--cool)}
 section{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
@@ -1165,6 +1316,11 @@ tbody tr:last-child td{border-bottom:0}
 .hit{color:var(--cool)}.dim{color:var(--dim)}
 .wrap{max-height:420px;overflow:auto}
 .empty{padding:16px;color:var(--dim)}
+.pager{display:flex;gap:8px;align-items:center;padding:8px 14px;border-top:1px solid var(--line);
+color:var(--dim);font-size:11px}
+.pager label{display:flex;gap:5px;align-items:center;margin-left:auto}
+.pager button:disabled{opacity:.4;cursor:default}
+.pager button:disabled:hover{border-color:var(--line)}
 nav{display:flex;gap:4px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--bg)}
 nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
 font:inherit;padding:9px 12px;cursor:pointer}
@@ -1269,15 +1425,28 @@ border-radius:6px;padding:9px 13px;display:none;max-width:min(420px,80vw)}
 </h2>
 <div class="wrap"><table><thead><tr>
 <th>名称</th><th class="n">请求</th><th class="n">失败</th><th class="n">输入</th><th class="n">输出</th>
-<th class="n">缓存读</th><th class="n">命中率</th>
+<th class="n">缓存读</th><th class="n">命中率</th><th class="n">费用</th>
 </tr></thead><tbody id="stats"></tbody></table></div>
 </section>
 <section>
 <h2>请求日志 <span id="logCount" class="dim"></span></h2>
 <div class="wrap"><table><thead><tr>
 <th>时间</th><th>模型</th><th>思考</th><th>渠道</th><th>Key</th><th class="n">状态</th><th class="n">耗时</th>
-<th class="n">输入</th><th class="n">输出</th><th class="n">缓存读</th><th class="n">命中率</th><th class="n">尝试</th>
+<th class="n">输入</th><th class="n">输出</th><th class="n">缓存读</th><th class="n">命中率</th><th class="n">费用</th><th class="n">尝试</th>
 </tr></thead><tbody id="log"></tbody></table></div>
+<div class="pager">
+<button class="act" id="logPrev">上一页</button>
+<button class="act" id="logNext">下一页</button>
+<span id="logPageInfo"></span>
+<label>每页
+<select id="logPageSize">
+<option value="50">50</option>
+<option value="100" selected>100</option>
+<option value="200">200</option>
+<option value="500">500</option>
+</select>
+</label>
+</div>
 </section>
 </div>
 
@@ -1345,6 +1514,32 @@ const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
 ));
 
+let currency = 'USD';
+let logPage = 1;
+let logPages = 1;
+let lastLogKey = null;
+const logSize = () => Number($('logPageSize').value) || 100;
+const money = (v) => {
+  if (v == null) return '-';
+  return (currency === 'CNY' ? '¥' : '$') + (v > 0 && v < 1 ? v.toFixed(4) : v.toFixed(2));
+};
+const NO_PRICE_TITLE = '模型未配置单价，可在 config.json 的 pricing.models 中补充';
+// Keeps "no usage" (-), "model has no price" (未定价) and a real amount distinguishable.
+const costCell = (row) => {
+  const priced = row.pricedRequests || 0;
+  const unpriced = row.unpricedRequests || 0;
+  if (!priced && !unpriced) return '<td class="n dim">-</td>';
+  if (!priced) return '<td class="n dim" title="' + NO_PRICE_TITLE + '">未定价</td>';
+  return '<td class="n">' + money(row.cost)
+    + (unpriced ? '<span class="sub" title="' + NO_PRICE_TITLE + '">+' + num(unpriced) + ' 未定价</span>' : '')
+    + '</td>';
+};
+const entryCostCell = (entry) => {
+  if (!entry.usage) return '<td class="n dim">-</td>';
+  if (entry.cost == null) return '<td class="n dim" title="' + NO_PRICE_TITLE + '">未定价</td>';
+  return '<td class="n">' + money(entry.cost) + '</td>';
+};
+
 function statusClass(entry) {
   if (entry.failed || (entry.status && entry.status >= 400)) return 's-bad';
   if (!entry.status) return 's-run';
@@ -1366,7 +1561,7 @@ function toast(message, ok) {
 }
 
 const FILTER_STORAGE_KEY = 'mini-dashboard-filters';
-const FILTER_CONTROL_IDS = ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached', 'statsMode', 'since', 'until'];
+const FILTER_CONTROL_IDS = ['fGroup', 'fModel', 'fKey', 'fStatus', 'fCached', 'statsMode', 'since', 'until', 'logPageSize'];
 
 function saveFilterState() {
   const active = document.querySelector('#range button.on');
@@ -1457,6 +1652,9 @@ function renderCards(stats, status) {
   const o = stats.overall;
   const cards = [
     ['总请求', num(o.requests)],
+    ['费用 (' + currency + ')', money(o.cost) + (o.unpricedRequests
+      ? '<span class="sub" title="' + NO_PRICE_TITLE + '">' + num(o.unpricedRequests) + ' 条未定价</span>'
+      : '')],
     ['缓存命中率', pct(o.cacheHitRate), o.cacheHitRate],
     ['缓存读取 tokens', tokens(o.cacheReadTokens)],
     ['输入 tokens', tokens(o.promptTokens)],
@@ -1496,7 +1694,8 @@ function renderStats(stats) {
     + '<td class="n">' + num(s.outputTokens) + '</td>'
     + '<td class="n hit">' + num(s.cacheReadTokens) + '</td>'
     + '<td class="n">' + pct(s.cacheHitRate) + '</td>'
-    + '</tr>').join('') : '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    + costCell(s)
+    + '</tr>').join('') : '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 }
 
 function renderLog(data) {
@@ -1516,9 +1715,33 @@ function renderLog(data) {
       + '<td class="n">' + tokens(u.outputTokens) + '</td>'
       + '<td class="n hit">' + tokens(u.cacheReadTokens) + '</td>'
       + '<td class="n">' + pct(e.cacheHitRate) + '</td>'
+      + entryCostCell(e)
       + '<td class="n ' + (e.attempts > 1 ? 's-run' : 'dim') + '">' + num(e.attempts) + '</td>'
       + '</tr>';
-  }).join('') : '<tr><td colspan="11" class="empty">暂无匹配的请求记录</td></tr>';
+  }).join('') : '<tr><td colspan="12" class="empty">暂无匹配的请求记录</td></tr>';
+  renderPager(data);
+}
+
+function renderPager(data) {
+  const size = logSize();
+  const pages = Math.max(1, Math.ceil(data.matched / size));
+  const page = Math.min(logPage, pages);
+  // The window shrank (filter or new data), so re-fetch at the clamped page.
+  if (page !== logPage) { logPage = page; refresh(); return; }
+  logPages = pages;
+  const from = data.entries.length ? data.offset + 1 : 0;
+  const to = data.offset + data.entries.length;
+  $('logPageInfo').textContent = '第 ' + page + ' / ' + pages + ' 页'
+    + (data.matched ? ' · ' + num(from) + '-' + num(to) + ' / ' + num(data.matched) : '');
+  $('logPrev').disabled = page <= 1;
+  $('logNext').disabled = page >= pages;
+}
+
+function setLogPage(page) {
+  const next = Math.max(1, Math.min(page, logPages));
+  if (next === logPage) return;
+  logPage = next;
+  refresh();
 }
 
 function renderChannels() {
@@ -1688,10 +1911,15 @@ let timer = null;
 async function refresh() {
   try {
     const query = filterQuery();
+    const size = logSize();
+    // Filters or page size changed: start over from page 1.
+    const logKey = query + '|' + size;
+    if (logKey !== lastLogKey) { lastLogKey = logKey; logPage = 1; }
+    const logQuery = 'limit=' + size + '&offset=' + (logPage - 1) * size + (query ? '&' + query : '');
     const [status, stats, log] = await Promise.all([
       get('/_mini/status').catch(() => null),
       get('/_mini/stats' + (query ? '?' + query : '')),
-      get('/_mini/requests?limit=200' + (query ? '&' + query : '')),
+      get('/_mini/requests?' + logQuery),
     ]);
     $('dot').className = 'on';
     if (status) {
@@ -1699,6 +1927,7 @@ async function refresh() {
       $('uptime').textContent = '运行 ' + Math.floor(status.uptimeMs / 1000) + 's';
       renderActive(status);
     }
+    if (stats.currency) currency = stats.currency;
     renderCards(stats, status);
     renderStats(stats);
     renderLog(log);
@@ -1755,6 +1984,9 @@ $('reset').addEventListener('click', () => {
   saveFilterState();
   refresh();
 });
+
+$('logPrev').addEventListener('click', () => setLogPage(logPage - 1));
+$('logNext').addEventListener('click', () => setLogPage(logPage + 1));
 
 $('addChannel').addEventListener('click', () => openChannelDialog(null));
 
@@ -2214,7 +2446,7 @@ function createProxyServer(rawConfig, options = {}) {
   const logOutput = options.log || defaultLog;
   const progress = createTerminalProgress(config, options.progress);
   const monitor = createMonitorState(() => config);
-  const requestLog = createRequestLog(config);
+  const requestLog = createRequestLog(config, () => config.pricing);
   const clientSockets = new Set();
 
   function log(line) {
@@ -2373,8 +2605,10 @@ function createProxyServer(rawConfig, options = {}) {
       if (clientUrl.pathname === '/_mini/requests') {
         const params = clientUrl.searchParams;
         const rawLimit = Number.parseInt(params.get('limit') || '100', 10);
+        const rawOffset = Number.parseInt(params.get('offset') || '0', 10);
         sendJson(response, 200, requestLog.query({
           limit: Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : 100,
+          offset: Number.isInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0,
           ...parseLogFilters(params),
         }));
         return;
@@ -2783,9 +3017,14 @@ module.exports = {
   applyConfigMutation,
   buildLocalModelList,
   cacheHitRate,
+  costOfEntry,
   createSseObserver,
+  entryCost,
+  matchPrice,
+  normalizePricing,
   normalizeUsage,
   parseLogFilters,
+  summarizeUsage,
   usageFromPayload,
   buildUpstreamUrl,
   bodyWithModel,

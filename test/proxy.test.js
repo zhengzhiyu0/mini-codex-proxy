@@ -1213,8 +1213,8 @@ test('a date range reaching past the memory cache is served from the jsonl histo
   const proxyPort = await listen(proxyServer);
   t.after(async () => { await close(proxyServer); await close(upstream); });
 
-  const query = async (search) => JSON.parse((await request({
-    port: proxyPort, path: `/_mini/requests?limit=100&${search}`, method: 'GET',
+  const query = async (params = '') => JSON.parse((await request({
+    port: proxyPort, path: `/_mini/requests?${params}`, method: 'GET',
   })).body.toString('utf8'));
 
   // Only the newest 3 entries live in memory.
@@ -1222,6 +1222,21 @@ test('a date range reaching past the memory cache is served from the jsonl histo
   const since = new Date(now - 45 * 86400000).toISOString();
   assert.equal((await query(`since=${since}`)).matched, 12);
   assert.equal((await query(`since=${since}&group=alpha&apiKey=laptop`)).matched, 6);
+
+  // offset windows the newest-first result set and clamps past the end.
+  const page = await query(`since=${since}&limit=5&offset=5`);
+  assert.equal(page.matched, 12);
+  assert.equal(page.offset, 5);
+  assert.equal(page.limit, 5);
+  assert.deepEqual(page.entries.map((entry) => entry.seq), [7, 6, 5, 4, 3]);
+
+  const beyond = await query(`since=${since}&limit=5&offset=99`);
+  assert.equal(beyond.offset, 12);
+  assert.deepEqual(beyond.entries, []);
+
+  // A malformed offset falls back to the first page.
+  assert.equal((await query(`since=${since}&limit=5&offset=-3`)).offset, 0);
+  assert.equal((await query(`since=${since}&limit=5&offset=abc`)).offset, 0);
 });
 
 test('dashboard config edits hot-apply, persist, and never expose secrets', async (t) => {
@@ -1409,5 +1424,78 @@ test('config mutations preserve unrelated groups and keep activeGroups consisten
   assert.throws(
     () => proxy.applyConfigMutation(raw, 'saveChannel', { name: 'has/slash' }),
     /must not contain/,
+  );
+});
+
+test('pricing bills cache reads and writes apart from plain input tokens', () => {
+  const pricing = proxy.normalizePricing({ models: { 'test-model': { input: 15, output: 75 } } });
+  const usage = { promptTokens: 3880, outputTokens: 145, cacheReadTokens: 0, cacheWriteTokens: 3878 };
+  const entry = { model: 'test-model', mappedModel: 'test-model', usage };
+  // 2 plain input at $15/M + 3878 cache-write at 1.25x input + 145 output at $75/M.
+  assert.equal(proxy.costOfEntry(entry, pricing), (2 * 15 + 3878 * 18.75 + 145 * 75) / 1e6);
+
+  const read = { promptTokens: 2000, outputTokens: 0, cacheReadTokens: 2000, cacheWriteTokens: 0 };
+  assert.equal(proxy.costOfEntry({ model: 'test-model', usage: read }, pricing), (2000 * 1.5) / 1e6);
+});
+
+test('config pricing overrides built-ins, supports prefix wildcards, and prefers the upstream name', () => {
+  const pricing = proxy.normalizePricing({
+    currency: 'CNY',
+    models: {
+      'claude-opus-5': { input: 1, output: 2 },
+      'acme-*': { input: 4, output: 8 },
+    },
+  });
+  assert.equal(pricing.currency, 'CNY');
+  assert.equal(proxy.matchPrice(pricing, 'claude-opus-5').input, 1);
+  // Models the overlay does not mention keep their built-in rate.
+  assert.equal(proxy.matchPrice(pricing, 'claude-sonnet-5').input, 3);
+  assert.equal(proxy.matchPrice(pricing, 'acme-pro-2').output, 8);
+  assert.equal(proxy.matchPrice(pricing, 'nothing-known'), null);
+
+  const usage = { promptTokens: 1e6, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const entry = { model: 'acme-pro-2', mappedModel: 'claude-opus-5', usage };
+  assert.equal(proxy.costOfEntry(entry, pricing), 1);
+});
+
+test('unpriced models and missing usage report null cost rather than zero', () => {
+  const pricing = proxy.normalizePricing({ models: {} });
+  const usage = { promptTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  assert.equal(proxy.costOfEntry({ model: 'mystery-model', usage }, pricing), null);
+  assert.equal(proxy.costOfEntry({ model: 'claude-opus-5', usage: null }, pricing), null);
+
+  const totals = proxy.summarizeUsage([
+    { model: 'claude-opus-5', usage: { promptTokens: 1e6, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    { model: 'mystery-model', usage },
+    { model: 'claude-opus-5', usage: null },
+  ], pricing);
+  assert.equal(totals.requests, 2);
+  assert.equal(totals.pricedRequests, 1);
+  assert.equal(totals.unpricedRequests, 1);
+  assert.equal(totals.cost, 15);
+});
+
+test('invalid pricing entries are rejected while loading config', () => {
+  const base = {
+    host: '127.0.0.1',
+    port: 8317,
+    upstream: { baseUrl: 'http://127.0.0.1:9/v1', apiKey: '' },
+  };
+  assert.equal(validateAndNormalizeConfig(base).pricing.currency, 'USD');
+  assert.throws(
+    () => validateAndNormalizeConfig({ ...base, pricing: { models: { x: { input: -1 } } } }),
+    /Invalid pricing\.models/,
+  );
+  assert.throws(
+    () => validateAndNormalizeConfig({ ...base, pricing: { models: { x: {} } } }),
+    /needs an "input" or "output" price/,
+  );
+  assert.throws(
+    () => validateAndNormalizeConfig({ ...base, pricing: { models: { x: 'free' } } }),
+    /must be an object/,
+  );
+  assert.throws(
+    () => validateAndNormalizeConfig({ ...base, pricing: { cacheReadMultiplier: -1 } }),
+    /Invalid pricing\.cacheReadMultiplier/,
   );
 });
