@@ -1014,7 +1014,12 @@ function costOfEntry(entry, pricing) {
 const SSE_TEXT_DELTA = /"type"\s*:\s*"(?:response\.output_text\.delta|text_delta)"/;
 
 function createSseObserver() {
-  let pending = '';
+  // Completion events can contain per-message usage attribution and exceed 64 KiB.
+  // Keep whole lines across network chunks; concatenate only once when a line ends.
+  const maxLineBytes = 16 * 1024 * 1024;
+  let pendingChunks = [];
+  let pendingBytes = 0;
+  let skippingLine = false;
   const state = {
     completed: false,
     failed: false,
@@ -1056,15 +1061,32 @@ function createSseObserver() {
 
   return {
     observe(chunk, observedAt = process.hrtime.bigint()) {
-      pending += chunk.toString('utf8');
-      let newlineAt = pending.indexOf('\n');
-      while (newlineAt !== -1) {
-        scanLine(pending.slice(0, newlineAt).trim(), observedAt);
-        pending = pending.slice(newlineAt + 1);
-        newlineAt = pending.indexOf('\n');
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let start = 0;
+      while (start < buffer.length) {
+        const newlineAt = buffer.indexOf(10, start);
+        const end = newlineAt === -1 ? buffer.length : newlineAt;
+        if (!skippingLine) {
+          const part = buffer.subarray(start, end);
+          pendingBytes += part.length;
+          if (pendingBytes > maxLineBytes) {
+            // Ignore the entire oversized line, then resume at the next newline.
+            pendingChunks = [];
+            pendingBytes = 0;
+            skippingLine = true;
+          } else if (part.length > 0) {
+            pendingChunks.push(part);
+          }
+        }
+        if (newlineAt === -1) break;
+        if (!skippingLine && pendingBytes > 0) {
+          scanLine(Buffer.concat(pendingChunks, pendingBytes).toString('utf8').trim(), observedAt);
+        }
+        pendingChunks = [];
+        pendingBytes = 0;
+        skippingLine = false;
+        start = newlineAt + 1;
       }
-      // Guard against an upstream that never emits a newline.
-      if (pending.length > 65536) pending = pending.slice(-1024);
     },
     state,
   };

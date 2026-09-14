@@ -873,6 +873,79 @@ test('cached tokens are folded into the prompt total for both upstream usage sha
   assert.equal(normalizeUsage({ prompt_tokens: 0, completion_tokens: 0 }), null);
 });
 
+function largeUsageFrame() {
+  return Buffer.from('event: response.completed\ndata: ' + JSON.stringify({
+    type: 'response.completed',
+    response: {
+      usage: {
+        attribution: { items: Object.fromEntries(Array.from({ length: 900 }, (_, i) => [
+          'item-' + i,
+          { input_tokens: 100, cached_tokens: 80, content: [{ input_tokens: 100, cached_tokens: 80 }] },
+        ])) },
+        input_tokens: 90000,
+        input_tokens_details: { cached_tokens: 72000 },
+        output_tokens: 5,
+      },
+    },
+  }) + '\n\n');
+}
+
+test('large Responses completion events retain usage across network chunks', () => {
+  const frame = largeUsageFrame();
+  assert.ok(frame.length > 65536);
+  for (const chunkSize of [1024, 4096, 16384, frame.length]) {
+    const observer = proxy.createSseObserver();
+    for (let i = 0; i < frame.length; i += chunkSize) {
+      observer.observe(frame.subarray(i, i + chunkSize));
+    }
+    assert.equal(observer.state.completed, true);
+    assert.deepEqual(observer.state.usage, {
+      promptTokens: 90000, outputTokens: 5, cacheReadTokens: 72000, cacheWriteTokens: 0,
+    });
+  }
+});
+
+test('oversized SSE lines are skipped without losing the next usage event', () => {
+  const observer = proxy.createSseObserver();
+  observer.observe(Buffer.from('data: '));
+  const block = Buffer.alloc(65536, 'x');
+  for (let i = 0; i < 257; i++) observer.observe(block);
+  observer.observe(Buffer.from('\n\n'));
+  observer.observe(largeUsageFrame());
+  assert.equal(observer.state.usage.cacheReadTokens, 72000);
+});
+
+test('large streamed usage reaches dashboard logs without changing the response', async (t) => {
+  const frame = largeUsageFrame();
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    let offset = 0;
+    const send = () => {
+      if (offset >= frame.length) return res.end();
+      res.write(frame.subarray(offset, offset + 4096));
+      offset += 4096;
+      setImmediate(send);
+    };
+    send();
+  });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, { logging: { enabled: false } }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+  const result = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', stream: true, input: 'OK' }),
+  });
+  assert.deepEqual(result.body, frame);
+  const logged = await request({ port: proxyPort, path: '/_mini/requests', method: 'GET' });
+  const { entries, totals } = JSON.parse(logged.body.toString('utf8'));
+  assert.equal(entries[0].usage.cacheReadTokens, 72000);
+  assert.equal(entries[0].cacheHitRate, 0.8);
+  assert.equal(totals.promptTokens, 90000);
+  assert.equal(totals.cacheReadTokens, 72000);
+});
+
 test('usage split across Anthropic stream events is merged into one record', async (t) => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
