@@ -1,0 +1,26 @@
+proxy.js
+  s_3aa43463e093c4::t_305c9e141a2312 1017-1022,1064-1088
+test/proxy.test.js
+  s_3aa43463e093c4::t_2369ddaee0619e 876-948
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "33decc75ec2224b66d33212655f6029f03e5298b",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  },
+  "sessions": {
+    "s_3aa43463e093c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e93b0ba-ee38-46e0-9ff0-9a6bf71a947d",
+        "model": "unknown"
+      },
+      "human_author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
