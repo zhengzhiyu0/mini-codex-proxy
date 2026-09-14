@@ -1427,6 +1427,25 @@ test('config mutations preserve unrelated groups and keep activeGroups consisten
   );
 });
 
+test('思考等级从各家请求体格式中读取', () => {
+  const effortOf = (payload) => proxy
+    .inspectRequestBody(Buffer.from(JSON.stringify(payload)), null)
+    .reasoningEffort;
+
+  // Anthropic Messages API: the level lives in output_config, not in thinking.
+  assert.equal(effortOf({
+    model: 'claude-opus-5',
+    thinking: { type: 'adaptive' },
+    output_config: { effort: 'high' },
+  }), 'high');
+  // Adaptive thinking with the default effort still reports the mode.
+  assert.equal(effortOf({ model: 'claude-opus-5', thinking: { type: 'adaptive' } }), 'adaptive');
+  // Codex responses API and OpenAI chat completions shapes keep working.
+  assert.equal(effortOf({ reasoning: { effort: 'medium' } }), 'medium');
+  assert.equal(effortOf({ reasoning_effort: 'low' }), 'low');
+  assert.equal(effortOf({ model: 'claude-opus-5' }), null);
+});
+
 test('pricing bills cache reads and writes apart from plain input tokens', () => {
   const pricing = proxy.normalizePricing({ models: { 'test-model': { input: 15, output: 75 } } });
   const usage = { promptTokens: 3880, outputTokens: 145, cacheReadTokens: 0, cacheWriteTokens: 3878 };

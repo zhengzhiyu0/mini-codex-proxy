@@ -534,7 +534,11 @@ function inspectRequestBody(body, contentEncoding) {
     if (typeof parsed.model === 'string') {
       result.requestedModel = parsed.model;
     }
-    if (typeof parsed.reasoning_effort === 'string') {
+    // Anthropic Messages API puts the level in output_config.effort; the other
+    // shapes below cover OpenAI chat completions and the Codex responses API.
+    if (parsed.output_config && typeof parsed.output_config.effort === 'string') {
+      result.reasoningEffort = parsed.output_config.effort;
+    } else if (typeof parsed.reasoning_effort === 'string') {
       result.reasoningEffort = parsed.reasoning_effort;
     } else if (typeof parsed.thinking === 'string') {
       result.reasoningEffort = parsed.thinking;
@@ -544,6 +548,10 @@ function inspectRequestBody(body, contentEncoding) {
       result.reasoningEffort = parsed.reasoning.effort;
     } else if (typeof parsed.effort === 'string') {
       result.reasoningEffort = parsed.effort;
+    } else if (parsed.thinking && typeof parsed.thinking.type === 'string') {
+      // No explicit level: fall back to the thinking mode so the monitor can tell
+      // "adaptive at the default effort" apart from "no thinking configured".
+      result.reasoningEffort = parsed.thinking.type;
     }
   } catch {
     // Preserve malformed JSON so the upstream can return its native error response.
