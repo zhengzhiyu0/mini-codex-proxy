@@ -1,0 +1,27 @@
+proxy.js
+  s_3aa43463e093c4::t_1329530aa97b86 537-541
+  s_3aa43463e093c4::t_0aed877afa8524 551-554
+test/proxy.test.js
+  s_3aa43463e093c4::t_b088a8743a8e89 1430-1448
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "53a2b1bf4c46ee693716135ed9b9d935f98d0d16",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  },
+  "sessions": {
+    "s_3aa43463e093c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0e93b0ba-ee38-46e0-9ff0-9a6bf71a947d",
+        "model": "anthropic.claude-opus-5:1m"
+      },
+      "human_author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
