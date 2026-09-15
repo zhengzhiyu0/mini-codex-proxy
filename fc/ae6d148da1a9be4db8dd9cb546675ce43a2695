@@ -1,0 +1,43 @@
+test/proxy.test.js
+  s_d68e86d8888bbd::t_a1c3ac1cee1033 1503-1612
+config.example.json
+  s_d68e86d8888bbd::t_3e9844c9b8b928 26-28
+README.md
+  s_d68e86d8888bbd::t_11762c6d5dfbf7 789-792
+  s_d68e86d8888bbd::t_3edc3c67d69459 331-361
+  s_d68e86d8888bbd::t_c8e4c63f24f8e4 275
+proxy.js
+  s_d68e86d8888bbd::t_59735ae9869c72 135-158
+  s_d68e86d8888bbd::t_98902caf7d77df 245-248
+  s_d68e86d8888bbd::t_379fb5a98c3239 2278-2279
+  s_d68e86d8888bbd::t_56fa4ab34200ff 2336,2340
+  s_d68e86d8888bbd::t_61cc331b8eef91 2926
+  s_d68e86d8888bbd::t_5bb2d41d827e94 1895-1898
+  s_d68e86d8888bbd::t_e3c1ce08308ab5 2051
+  s_d68e86d8888bbd::t_c523ccb77c3b92 2376-2383
+  s_d68e86d8888bbd::t_359df7b4f8333c 591-600,602-622,624
+  s_d68e86d8888bbd::t_9bb997d2bc76b4 2032-2035
+  s_d68e86d8888bbd::t_6bf0c931731aab 2007
+  s_d68e86d8888bbd::t_461be7b439a856 2263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fcae6d148da1a9be4db8dd9cb546675ce43a2695",
+  "prompts": {},
+  "humans": {
+    "h_49201e0a695903": {
+      "author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  },
+  "sessions": {
+    "s_d68e86d8888bbd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "618f3b50-25ed-4aee-858e-7f18d8a24b1e",
+        "model": "anthropic.claude-opus-5:1m"
+      },
+      "human_author": "zhengzhiyu <zhengzhiyuu@icloud.com>"
+    }
+  }
+}
