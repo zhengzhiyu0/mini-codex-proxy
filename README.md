@@ -593,6 +593,9 @@ http://127.0.0.1:8317/_mini
 - 模型映射：左侧填客户端请求用的模型名（别名），右侧填转发到上游的真实模型名。
   点「拉取上游模型」会用该渠道自己的凭据请求上游 `/models`，拉到的列表会把右侧变成
   下拉框方便选择；拉取只在点按钮时发生，启动时不会自动请求上游
+- 模型连通性测试：每行有「测试」，顶部有「测试全部」。代理会按渠道支持的接口优先用
+  `responses` → `chat` → `messages` 向上游发一条短非流式请求，面板显示状态码、耗时和回复摘要。
+  测试走管理接口，不经过客户端鉴权，也不会写入请求日志
 
 ### API Key
 
@@ -619,7 +622,10 @@ key 都可以通过校验；停用后立即失效。名称会记录到请求日�
 GET  /_mini/config          读取脱敏后的配置
 POST /_mini/config          { "action": "...", "payload": { ... } }
 POST /_mini/config/models   { "name": "渠道名" } 拉取该渠道的上游模型列表
+POST /_mini/config/test     { "name": "渠道名", "alias"?: "模型别名" } 测试模型是否可用
 ```
+
+不传 `alias` 时测试该渠道全部已保存映射；传入时只测一个。返回每条结果的 `ok`、`status`、`latencyMs`、`preview` / `error`。
 
 `action` 支持 `saveChannel`、`deleteChannel`、`toggleChannel`、`saveModels`、`saveClientKeys`。
 
@@ -808,4 +814,4 @@ Copy-Item .\config.example.json .\config.json
 npm test
 ```
 
-测试会启动本地模拟上游，不需要真实 API Key，也不会访问真实模型服务。覆盖模型映射、字段保留、统一 Key 验证、上游 Authorization、非流式响应、分块 SSE、reasoning/tool/completed 事件、错误透传、模型注入、多渠道同时启用、按接口路由、跨组切换、`组名/别名` 定向、故障切换、两种 usage 字段折算、流式 usage 合并、缓存命中筛选与分组统计、WebUI 面板与 loopback 限制、JSON Lines 落盘与重启后回读、日志脱敏、502 和正常关闭。
+测试会启动本地模拟上游，不需要真实 API Key，也不会访问真实模型服务。覆盖模型映射、字段保留、统一 Key 验证、上游 Authorization、非流式响应、分块 SSE、reasoning/tool/completed 事件、错误透传、模型注入、多渠道同时启用、按接口路由、跨组切换、`组名/别名` 定向、故障切换、两种 usage 字段折算、流式 usage 合并、缓存命中筛选与分组统计、WebUI 面板与 loopback 限制、模型连通性测试、JSON Lines 落盘与重启后回读、日志脱敏、502 和正常关闭。

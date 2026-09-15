@@ -18,7 +18,10 @@ const HOP_BY_HOP_HEADERS = new Set([
   'upgrade',
 ]);
 
-const FAILOVER_STATUS_CODES = new Set([502, 503, 520, 524]);
+const FAILOVER_STATUS_CODES = new Set([502, 503, 504, 520, 524]);
+
+const DEFAULT_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MANAGEMENT_BODY_BYTES = 1024 * 1024;
 
 const ANSI = {
   reset: '\x1b[0m',
@@ -143,6 +146,9 @@ function normalizeStripRequestFields(input, fieldName) {
   const paths = [];
   const seen = new Set();
   for (const item of input) {
+    if (typeof item !== 'string' && !Array.isArray(item)) {
+      throw new Error(`Invalid ${fieldName} entry: ${JSON.stringify(item)}`);
+    }
     const segments = (Array.isArray(item) ? item : String(item ?? '').split('.'))
       .map((part) => (typeof part === 'string' ? part.trim() : ''));
     if (segments.length === 0 || segments.some((part) => !part)) {
@@ -418,6 +424,34 @@ function validateAndNormalizeConfig(input) {
     throw new Error('Invalid timeouts.connectTimeoutMs');
   }
 
+  const headersTimeoutMs = input.timeouts?.headersTimeoutMs === undefined
+    ? 60000
+    : input.timeouts.headersTimeoutMs;
+  if (!Number.isInteger(headersTimeoutMs) || headersTimeoutMs <= 0) {
+    throw new Error('Invalid timeouts.headersTimeoutMs');
+  }
+
+  const idleTimeoutMs = input.timeouts?.idleTimeoutMs === undefined
+    ? 300000
+    : input.timeouts.idleTimeoutMs;
+  if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < 0) {
+    throw new Error('Invalid timeouts.idleTimeoutMs');
+  }
+
+  const requestBodyBytes = input.limits?.requestBodyBytes === undefined
+    ? DEFAULT_REQUEST_BODY_BYTES
+    : input.limits.requestBodyBytes;
+  if (!Number.isInteger(requestBodyBytes) || requestBodyBytes <= 0) {
+    throw new Error('Invalid limits.requestBodyBytes');
+  }
+
+  const managementBodyBytes = input.limits?.managementBodyBytes === undefined
+    ? DEFAULT_MANAGEMENT_BODY_BYTES
+    : input.limits.managementBodyBytes;
+  if (!Number.isInteger(managementBodyBytes) || managementBodyBytes <= 0) {
+    throw new Error('Invalid limits.managementBodyBytes');
+  }
+
   const refreshIntervalMs = input.progress?.refreshIntervalMs === undefined
     ? 100
     : input.progress.refreshIntervalMs;
@@ -473,8 +507,9 @@ function validateAndNormalizeConfig(input) {
     webui: {
       enabled: input.webui?.enabled !== false,
     },
+    limits: { requestBodyBytes, managementBodyBytes },
     debug: input.debug === true,
-    timeouts: { connectTimeoutMs },
+    timeouts: { connectTimeoutMs, headersTimeoutMs, idleTimeoutMs },
   };
 
   const modelsGroups = activeGroups.filter((name) => groups[name].endpoints.has('models'));
@@ -527,13 +562,151 @@ function buildUpstreamUrl(baseUrl, canonicalPath, search) {
   return url;
 }
 
-function readRequestBody(request) {
+// Prefer inference endpoints that can prove a model actually answers.
+const MODEL_PROBE_ENDPOINTS = [
+  { name: 'responses', canonicalPath: '/responses' },
+  { name: 'chat', canonicalPath: '/chat/completions' },
+  { name: 'messages', canonicalPath: '/messages' },
+];
+
+const MODEL_PROBE_PROMPT = 'Reply with exactly: ok';
+const MODEL_PROBE_MAX_BODY_BYTES = 256 * 1024;
+const MODEL_PROBE_PREVIEW_CHARS = 160;
+
+function pickProbeEndpoint(group) {
+  for (const endpoint of MODEL_PROBE_ENDPOINTS) {
+    if (group.endpoints.has(endpoint.name)) return endpoint;
+  }
+  return null;
+}
+
+function buildModelProbeBody(endpointName, model) {
+  if (endpointName === 'responses') {
+    return {
+      model,
+      input: MODEL_PROBE_PROMPT,
+      max_output_tokens: 16,
+      stream: false,
+    };
+  }
+  if (endpointName === 'chat') {
+    return {
+      model,
+      messages: [{ role: 'user', content: MODEL_PROBE_PROMPT }],
+      max_tokens: 16,
+      stream: false,
+    };
+  }
+  return {
+    model,
+    max_tokens: 16,
+    messages: [{ role: 'user', content: MODEL_PROBE_PROMPT }],
+    stream: false,
+  };
+}
+
+function applyStripPathsToObject(value, stripPaths) {
+  let next = value;
+  for (const segments of stripPaths || []) {
+    next = withoutPath(next, segments);
+  }
+  return next;
+}
+
+function truncateProbeText(text) {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (cleaned.length <= MODEL_PROBE_PREVIEW_CHARS) return cleaned;
+  return `${cleaned.slice(0, MODEL_PROBE_PREVIEW_CHARS)}…`;
+}
+
+function extractProbePreview(endpointName, payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '';
+
+  if (typeof payload.error === 'string') return truncateProbeText(payload.error);
+  if (payload.error && typeof payload.error.message === 'string') {
+    return truncateProbeText(payload.error.message);
+  }
+
+  if (endpointName === 'chat') {
+    const content = payload.choices?.[0]?.message?.content;
+    if (typeof content === 'string') return truncateProbeText(content);
+    if (Array.isArray(content)) {
+      return truncateProbeText(content
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .join(''));
+    }
+  }
+
+  if (endpointName === 'messages') {
+    if (Array.isArray(payload.content)) {
+      return truncateProbeText(payload.content
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .join(''));
+    }
+  }
+
+  if (endpointName === 'responses') {
+    if (typeof payload.output_text === 'string') return truncateProbeText(payload.output_text);
+    if (Array.isArray(payload.output)) {
+      const parts = [];
+      for (const item of payload.output) {
+        if (!item || typeof item !== 'object') continue;
+        if (typeof item.text === 'string') parts.push(item.text);
+        if (Array.isArray(item.content)) {
+          for (const part of item.content) {
+            if (typeof part?.text === 'string') parts.push(part.text);
+          }
+        }
+      }
+      return truncateProbeText(parts.join(''));
+    }
+  }
+
+  return '';
+}
+
+function bodyTooLargeError(limit) {
+  const error = new Error(`Request body exceeds ${limit} bytes`);
+  error.statusCode = 413;
+  error.code = 'BODY_TOO_LARGE';
+  return error;
+}
+
+function readRequestBody(request, limit = DEFAULT_REQUEST_BODY_BYTES) {
   return new Promise((resolve, reject) => {
+    const declaredLength = Number(request.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > limit) {
+      request.resume();
+      reject(bodyTooLargeError(limit));
+      return;
+    }
+
     const chunks = [];
-    request.on('data', (chunk) => chunks.push(chunk));
-    request.on('end', () => resolve(Buffer.concat(chunks)));
-    request.on('aborted', () => reject(new Error('Client aborted the request')));
-    request.on('error', reject);
+    let bytes = 0;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    request.on('data', (chunk) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > limit) {
+        chunks.length = 0;
+        fail(bodyTooLargeError(limit));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, bytes));
+    });
+    request.on('aborted', () => fail(new Error('Client aborted the request')));
+    request.on('error', fail);
   });
 }
 
@@ -664,6 +837,48 @@ function safeTokenEqual(actual, expected) {
   return crypto.timingSafeEqual(actualHash, expectedHash);
 }
 
+function firstHeaderValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function isLoopbackHost(hostHeader) {
+  if (typeof hostHeader !== 'string' || !hostHeader) return false;
+  try {
+    const hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+    return hostname === 'localhost'
+      || hostname === '::1'
+      || hostname === '[::1]'
+      || hostname.startsWith('127.');
+  } catch {
+    return false;
+  }
+}
+
+function managementRequestError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function validateManagementWriteRequest(request, csrfToken) {
+  const contentType = String(firstHeaderValue(request.headers['content-type']) || '');
+  if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    throw managementRequestError(415, 'Management writes require application/json');
+  }
+
+  const origin = firstHeaderValue(request.headers.origin);
+  if (origin === undefined) return;
+
+  const expectedOrigin = `http://${request.headers.host}`;
+  if (origin !== expectedOrigin) {
+    throw managementRequestError(403, 'Untrusted management request origin');
+  }
+  const presentedToken = firstHeaderValue(request.headers['x-mini-codex-csrf']);
+  if (!safeTokenEqual(presentedToken, csrfToken)) {
+    throw managementRequestError(403, 'Invalid management request token');
+  }
+}
+
 // Returns which named key matched so the request log can attribute traffic per key.
 // Disabled keys never authorize, and the secret itself is never surfaced to callers.
 function authorizeClient(request, config) {
@@ -723,7 +938,7 @@ function serializeMonitorRequest(metrics, now = process.hrtime.bigint()) {
     ? Math.round(elapsedSeconds(metrics.startedAt, metrics.firstOutputTextAt) * 1000)
     : null;
   let state = 'connecting';
-  if (metrics.endedAt) state = metrics.status >= 200 && metrics.status < 400 ? 'completed' : 'failed';
+  if (metrics.endedAt) state = metrics.failed ? 'failed' : 'completed';
   else if (metrics.firstByteAt) state = 'streaming';
   else if (metrics.status) state = 'waiting';
 
@@ -1383,15 +1598,25 @@ function createRequestLog(config, getPricing = () => config.pricing) {
         (byApiKey[entry.apiKeyName || 'unknown'] ||= []).push(entry);
       }
       const shape = (source) => Object.fromEntries(
-        Object.entries(source).map(([key, list]) => [key, {
-          requests: list.length,
-          failed: list.filter((entry) => entry.failed).length,
-          ...summarizeUsage(list, pricing),
-        }]),
+        Object.entries(source).map(([key, list]) => {
+          const usage = summarizeUsage(list, pricing);
+          return [key, {
+            ...usage,
+            usageRequests: usage.requests,
+            requests: list.length,
+            failed: list.filter((entry) => entry.failed).length,
+          }];
+        }),
       );
+      const overallUsage = summarizeUsage(matched, pricing);
       return {
         currency: pricing.currency,
-        overall: { requests: matched.length, ...summarizeUsage(matched, pricing) },
+        overall: {
+          ...overallUsage,
+          usageRequests: overallUsage.requests,
+          requests: matched.length,
+          failed: matched.filter((entry) => entry.failed).length,
+        },
         byGroup: shape(byGroup),
         byModel: shape(byModel),
         byApiKey: shape(byApiKey),
@@ -1482,8 +1707,12 @@ border-bottom:1px solid var(--line)}
 .grid2 label{display:grid;gap:4px;color:var(--dim);font-size:11px}
 .grid2.full{grid-template-columns:1fr}
 .map{display:grid;gap:6px;padding:14px}
-.map .mrow{display:grid;grid-template-columns:1fr 24px 1fr auto;gap:6px;align-items:center}
+.map .mrow{display:grid;grid-template-columns:1fr 24px 1fr auto auto;gap:6px;align-items:center}
 .map .arw{text-align:center;color:var(--dim)}
+.map .mprobe{grid-column:1/-1;font-size:11px;padding:2px 0 6px 0;color:var(--dim)}
+.map .mprobe.ok{color:var(--ok)}
+.map .mprobe.bad{color:var(--bad)}
+.map .mprobe.run{color:var(--warm)}
 .note{padding:0 14px 12px;color:var(--dim);font-size:11px}
 dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:8px;
 padding:0;min-width:min(560px,92vw);font:inherit}
@@ -1586,11 +1815,13 @@ border-radius:6px;padding:9px 13px;display:none;max-width:min(420px,80vw)}
 <h2>模型映射
 <select id="mapGroup" style="margin-left:auto"></select>
 <button class="act" id="pullModels">拉取上游模型</button>
+<button class="act" id="testModels">测试全部</button>
 <button class="act pri" id="saveModels">保存映射</button>
 </h2>
 <div class="map" id="mapRows"></div>
 <div class="note">左侧是客户端请求的模型名（别名），右侧是转发到上游的真实模型名。
-点“拉取上游模型”后右侧可从上游列表中选择。留空的行会被忽略。</div>
+点“拉取上游模型”后右侧可从上游列表中选择。留空的行会被忽略。
+“测试”会向上游发一条短请求，确认该模型是否可用。</div>
 </section>
 </div>
 
@@ -1618,6 +1849,7 @@ border-radius:6px;padding:9px 13px;display:none;max-width:min(420px,80vw)}
 </div>
 </form></dialog>
 <script>
+const CSRF_TOKEN = __MINI_CODEX_CSRF_TOKEN__;
 const $ = (id) => document.getElementById(id);
 const num = (v) => (v == null ? '-' : Number(v).toLocaleString());
 const tokens = (v) => {
@@ -1685,6 +1917,7 @@ function statusClass(entry) {
 
 let cfg = { groups: [], clientApiKeys: [], activeGroups: [] };
 const upstreamModels = {};
+const probeResults = {};
 let mapDraft = null;
 let keyDraft = null;
 
@@ -1918,18 +2151,39 @@ function mapTargetCell(target, list) {
     + '</select>';
 }
 
+function probeLabel(result) {
+  if (!result) return '';
+  if (result.pending) return '测试中…';
+  const time = result.latencyMs == null ? '' : ' · ' + ms(result.latencyMs);
+  if (result.ok) {
+    return '✓ ' + (result.status || 200) + time
+      + (result.preview ? ' · ' + result.preview : '');
+  }
+  return '✗ ' + (result.status || '失败') + time
+    + ' · ' + (result.error || result.preview || '不可用');
+}
+
 function renderMap() {
   const name = $('mapGroup').value;
   const group = cfg.groups.find((g) => g.name === name);
   if (!group) { $('mapRows').innerHTML = '<div class="empty">请先新增渠道。</div>'; return; }
   if (mapDraft === null) mapDraft = Object.entries(group.models);
   const list = upstreamModels[name];
-  $('mapRows').innerHTML = mapDraft.map(([alias, target], i) => '<div class="mrow">'
-    + '<input class="ma" value="' + esc(alias) + '" placeholder="客户端模型名">'
-    + '<span class="arw">&rarr;</span>'
-    + mapTargetCell(target, list)
-    + '<button class="act del" data-maprm="' + i + '">删除</button>'
-    + '</div>').join('')
+  const probes = probeResults[name] || {};
+  $('mapRows').innerHTML = mapDraft.map(([alias, target], i) => {
+    const probe = probes[alias];
+    const probeClass = !probe ? ''
+      : probe.pending ? 'run' : (probe.ok ? 'ok' : 'bad');
+    return '<div class="mrow">'
+      + '<input class="ma" value="' + esc(alias) + '" placeholder="客户端模型名">'
+      + '<span class="arw">&rarr;</span>'
+      + mapTargetCell(target, list)
+      + '<button class="act" data-maptest="' + i + '"'
+      + (probe && probe.pending ? ' disabled' : '') + '>测试</button>'
+      + '<button class="act del" data-maprm="' + i + '">删除</button>'
+      + '</div>'
+      + (probe ? '<div class="mprobe ' + probeClass + '">' + esc(probeLabel(probe)) + '</div>' : '');
+  }).join('')
     + '<div><button class="act" id="addMap">新增一行</button>'
     + (list ? ' <span class="dim">上游可用 ' + list.length + ' 个模型</span>' : '')
     + '</div>';
@@ -1976,7 +2230,10 @@ async function get(url) {
 async function post(url, body) {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-mini-codex-csrf': CSRF_TOKEN,
+    },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -2167,8 +2424,65 @@ $('mapRows').addEventListener('click', (event) => {
   } else if (button.dataset.maprm !== undefined) {
     readMapDraft().splice(Number(button.dataset.maprm), 1);
     renderMap();
+  } else if (button.dataset.maptest !== undefined) {
+    const index = Number(button.dataset.maptest);
+    const draft = readMapDraft();
+    const alias = draft[index] ? draft[index][0] : '';
+    if (!alias) { toast('请先填写客户端模型名', false); return; }
+    runModelTests(alias);
   }
 });
+
+async function runModelTests(alias) {
+  const name = $('mapGroup').value;
+  if (!name) return;
+  const group = cfg.groups.find((g) => g.name === name);
+  if (!group) return;
+
+  // Prefer the saved mapping so an unsaved draft does not hit the wrong upstream name.
+  const aliases = alias
+    ? [alias]
+    : Object.keys(group.models);
+  if (aliases.length === 0) {
+    toast('当前渠道没有已保存的模型映射', false);
+    return;
+  }
+  if (alias && !Object.prototype.hasOwnProperty.call(group.models, alias)) {
+    toast('请先保存该模型映射再测试', false);
+    return;
+  }
+
+  if (!probeResults[name]) probeResults[name] = {};
+  for (const key of aliases) {
+    probeResults[name][key] = { pending: true };
+  }
+  renderMap();
+  $('testModels').disabled = true;
+  $('testModels').textContent = '测试中…';
+
+  try {
+    const data = await post('/_mini/config/test', alias ? { name, alias } : { name });
+    for (const result of data.results || []) {
+      probeResults[name][result.alias] = result;
+    }
+    const failed = (data.results || []).filter((r) => !r.ok).length;
+    const total = (data.results || []).length;
+    toast(failed
+      ? total + ' 个模型测完，' + failed + ' 个失败'
+      : total + ' 个模型均正常', !failed);
+  } catch (error) {
+    for (const key of aliases) {
+      if (probeResults[name][key] && probeResults[name][key].pending) {
+        probeResults[name][key] = { ok: false, error: error.message };
+      }
+    }
+    toast('测试失败: ' + error.message, false);
+  } finally {
+    $('testModels').disabled = false;
+    $('testModels').textContent = '测试全部';
+    renderMap();
+  }
+}
 
 $('pullModels').addEventListener('click', async () => {
   const name = $('mapGroup').value;
@@ -2186,6 +2500,8 @@ $('pullModels').addEventListener('click', async () => {
     $('pullModels').textContent = '拉取上游模型';
   }
 });
+
+$('testModels').addEventListener('click', () => runModelTests(null));
 
 $('saveModels').addEventListener('click', () => {
   const name = $('mapGroup').value;
@@ -2300,8 +2616,13 @@ function buildConfigView(raw, config) {
 
 async function writeConfigFile(file, raw) {
   const temp = `${file}.${process.pid}.tmp`;
-  await fs.promises.writeFile(temp, `${JSON.stringify(raw, null, 2)}\n`);
-  await fs.promises.rename(temp, file);
+  try {
+    await fs.promises.writeFile(temp, `${JSON.stringify(raw, null, 2)}\n`);
+    await fs.promises.rename(temp, file);
+  } catch (error) {
+    await fs.promises.rm(temp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function requireGroupName(payload) {
@@ -2353,14 +2674,17 @@ function applyConfigMutation(raw, action, payload = {}) {
   if (action === 'saveChannel') {
     const name = requireGroupName(payload);
     const existing = groups[name];
-    const previousKey = rawGroupUpstreams(existing || {})[0]?.apiKey || '';
+    const previousUpstreams = rawGroupUpstreams(existing || {});
+    const previousPrimary = previousUpstreams[0] || {};
+    const previousKey = previousPrimary.apiKey || '';
     const submittedKey = typeof payload.apiKey === 'string' ? payload.apiKey.trim() : '';
 
     groups[name] = {
       ...existing,
       priority: Number.isFinite(payload.priority) ? payload.priority : (existing?.priority ?? 0),
       upstream: {
-        name,
+        ...previousPrimary,
+        name: previousPrimary.name || name,
         baseUrl: typeof payload.baseUrl === 'string' ? payload.baseUrl.trim() : '',
         // An empty submission means the panel never saw the secret, so keep it.
         apiKey: submittedKey || previousKey,
@@ -2381,7 +2705,12 @@ function applyConfigMutation(raw, action, payload = {}) {
       ).map((segments) => segments.join('.'));
       if (groups[name].stripRequestFields.length === 0) delete groups[name].stripRequestFields;
     }
-    delete groups[name].upstreams;
+    if (Array.isArray(existing?.upstreams) && existing.upstreams.length > 0) {
+      groups[name].upstreams = [groups[name].upstream, ...existing.upstreams.slice(1)];
+      delete groups[name].upstream;
+    } else {
+      delete groups[name].upstreams;
+    }
     activeGroups = setGroupActive(activeGroups, name, payload.enabled !== false);
   } else if (action === 'deleteChannel') {
     const name = requireGroupName(payload);
@@ -2459,8 +2788,8 @@ function parseLogFilters(params, now = Date.now()) {
   return filters;
 }
 
-function renderDashboardHtml() {
-  return DASHBOARD_HTML;
+function renderDashboardHtml(csrfToken) {
+  return DASHBOARD_HTML.replace('__MINI_CODEX_CSRF_TOKEN__', JSON.stringify(csrfToken));
 }
 
 function defaultLog(line) {
@@ -2470,7 +2799,8 @@ function defaultLog(line) {
 function createTerminalProgress(config, options = {}) {
   const output = options.output || process.stdout;
   const isInteractive = config.progress.enabled && (options.isTTY ?? output.isTTY) === true;
-  const colorsEnabled = isInteractive && config.progress.color && process.env.NO_COLOR === undefined;
+  const colorsEnabled = isInteractive && (options.colorEnabled
+    ?? (config.progress.color && process.env.NO_COLOR === undefined));
   const active = new Map();
   const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let frameIndex = 0;
@@ -2601,6 +2931,9 @@ function createProxyServer(rawConfig, options = {}) {
   // and tests default to in-memory-only edits.
   const configFile = typeof options.configFile === 'string' ? options.configFile : null;
   const logOutput = options.log || defaultLog;
+  const managementToken = crypto.randomBytes(32).toString('base64url');
+  const httpAgent = new http.Agent({ keepAlive: true, maxFreeSockets: 16 });
+  const httpsAgent = new https.Agent({ keepAlive: true, maxFreeSockets: 16 });
   const progress = createTerminalProgress(config, options.progress);
   const monitor = createMonitorState(() => config);
   const requestLog = createRequestLog(config, () => config.pricing);
@@ -2669,13 +3002,160 @@ function createProxyServer(rawConfig, options = {}) {
     });
   }
 
+  // One short non-stream completion against the channel's primary upstream.
+  function probeModel(group, alias, targetModel) {
+    const started = Date.now();
+    const endpoint = pickProbeEndpoint(group);
+    const upstream = group.upstreams[0];
+    const base = {
+      alias,
+      model: targetModel,
+      group: group.name,
+      upstream: upstream ? upstream.name : null,
+      endpoint: endpoint ? endpoint.name : null,
+      status: null,
+      latencyMs: null,
+      preview: '',
+      ok: false,
+      error: null,
+    };
+
+    if (!endpoint) {
+      return Promise.resolve({
+        ...base,
+        error: 'Channel has no inference endpoint (responses/chat/messages)',
+        latencyMs: Date.now() - started,
+      });
+    }
+    if (!upstream) {
+      return Promise.resolve({
+        ...base,
+        error: `Channel ${group.name} has no upstream`,
+        latencyMs: Date.now() - started,
+      });
+    }
+
+    const payload = applyStripPathsToObject(
+      buildModelProbeBody(endpoint.name, targetModel),
+      group.stripRequestFields,
+    );
+    const body = Buffer.from(JSON.stringify(payload));
+    const url = buildUpstreamUrl(upstream.baseUrl, endpoint.canonicalPath, '');
+    const transport = url.protocol === 'https:' ? https : http;
+    const headers = {
+      accept: 'application/json',
+      'accept-encoding': 'identity',
+      'content-type': 'application/json',
+      'content-length': String(body.length),
+    };
+    if (upstream.apiKey) {
+      if (upstream.authStyle === 'x-api-key') headers['x-api-key'] = upstream.apiKey;
+      else headers.authorization = `Bearer ${upstream.apiKey}`;
+    }
+    if (endpoint.name === 'messages' || upstream.authStyle === 'x-api-key') {
+      headers['anthropic-version'] = '2023-06-01';
+    }
+
+    const overallTimeoutMs = Math.max(
+      config.timeouts.connectTimeoutMs + config.timeouts.headersTimeoutMs,
+      15000,
+    );
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          ...base,
+          ...result,
+          latencyMs: Date.now() - started,
+        });
+      };
+
+      const upstreamRequest = transport.request(url, {
+        method: 'POST',
+        headers,
+        agent: url.protocol === 'https:' ? httpsAgent : httpAgent,
+      }, (upstreamResponse) => {
+        const status = upstreamResponse.statusCode || 502;
+        const chunks = [];
+        let bytes = 0;
+        upstreamResponse.on('data', (chunk) => {
+          bytes += chunk.length;
+          if (bytes <= MODEL_PROBE_MAX_BODY_BYTES) chunks.push(chunk);
+        });
+        upstreamResponse.once('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          let parsed = null;
+          try {
+            parsed = raw ? JSON.parse(raw) : null;
+          } catch {
+            parsed = null;
+          }
+          const preview = extractProbePreview(endpoint.name, parsed)
+            || truncateProbeText(raw);
+          const ok = status >= 200 && status < 300;
+          finish({
+            status,
+            preview,
+            ok,
+            error: ok ? null : (preview || `Upstream returned ${status}`),
+          });
+        });
+        upstreamResponse.once('error', (error) => {
+          finish({ status, error: error.message, preview: '' });
+        });
+      });
+
+      upstreamRequest.setTimeout(overallTimeoutMs, () => {
+        upstreamRequest.destroy(new Error(`Model probe timed out after ${overallTimeoutMs}ms`));
+      });
+      upstreamRequest.once('error', (error) => {
+        finish({
+          status: error.code === 'ETIMEDOUT' ? 504 : 502,
+          error: error.message,
+          preview: '',
+        });
+      });
+      upstreamRequest.end(body);
+    });
+  }
+
+  async function testChannelModels(name, alias) {
+    const group = typeof name === 'string' ? config.groups[name] : undefined;
+    if (!group) throw new Error(`Unknown channel: ${name || '<empty>'}`);
+
+    let entries;
+    if (alias === undefined || alias === null || alias === '') {
+      entries = Object.entries(group.models);
+    } else if (typeof alias !== 'string' || !alias.trim()) {
+      throw new Error('Invalid model alias');
+    } else if (!Object.prototype.hasOwnProperty.call(group.models, alias.trim())) {
+      throw new Error(`Unknown model alias: ${alias.trim()}`);
+    } else {
+      const key = alias.trim();
+      entries = [[key, group.models[key]]];
+    }
+
+    if (entries.length === 0) {
+      throw new Error(`Channel ${name} has no model mappings`);
+    }
+
+    const results = [];
+    for (const [modelAlias, targetModel] of entries) {
+      results.push(await probeModel(group, modelAlias, targetModel));
+    }
+    return { name, results };
+  }
+
   // Validation runs before the swap so a bad edit leaves the running proxy untouched.
   async function applyMutation(action, payload) {
     const candidateRaw = applyConfigMutation(raw, action, payload);
     const candidate = validateAndNormalizeConfig(candidateRaw);
+    if (configFile) await writeConfigFile(configFile, candidateRaw);
     config = candidate;
     raw = candidateRaw;
-    if (configFile) await writeConfigFile(configFile, raw);
     return candidate;
   }
 
@@ -2688,11 +3168,12 @@ function createProxyServer(rawConfig, options = {}) {
     if (clientUrl.pathname === '/_mini/status'
       || clientUrl.pathname.startsWith('/_mini/')
       || clientUrl.pathname === '/_mini') {
-      if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      if (!isLoopbackAddress(request.socket.remoteAddress)
+        || !isLoopbackHost(request.headers.host)) {
         sendJson(response, 403, { error: { message: 'Local access only', type: 'forbidden' } });
         return;
       }
-      const writePaths = new Set(['/_mini/config', '/_mini/config/models']);
+      const writePaths = new Set(['/_mini/config', '/_mini/config/models', '/_mini/config/test']);
       const isWrite = request.method === 'POST' && writePaths.has(clientUrl.pathname);
       if (request.method !== 'GET' && !isWrite) {
         sendJson(response, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
@@ -2713,13 +3194,14 @@ function createProxyServer(rawConfig, options = {}) {
       if (isWrite) {
         let payload;
         try {
-          const body = await readRequestBody(request);
+          validateManagementWriteRequest(request, managementToken);
+          const body = await readRequestBody(request, config.limits.managementBodyBytes);
           payload = body.length > 0 ? JSON.parse(body.toString('utf8')) : {};
           if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
             throw new Error('Expected a JSON object');
           }
         } catch (error) {
-          sendJson(response, 400, {
+          sendJson(response, error.statusCode || 400, {
             error: { message: `Invalid request body: ${error.message}`, type: 'invalid_request_error' },
           });
           return;
@@ -2732,6 +3214,19 @@ function createProxyServer(rawConfig, options = {}) {
           } catch (error) {
             sendJson(response, 502, {
               error: { message: error.message, type: 'upstream_connection_error' },
+            });
+          }
+          return;
+        }
+
+        if (clientUrl.pathname === '/_mini/config/test') {
+          try {
+            const result = await testChannelModels(payload.name, payload.alias);
+            sendJson(response, 200, result);
+          } catch (error) {
+            const status = /Unknown|Invalid|no model/i.test(error.message) ? 400 : 502;
+            sendJson(response, status, {
+              error: { message: error.message, type: status === 400 ? 'invalid_request_error' : 'upstream_connection_error' },
             });
           }
           return;
@@ -2781,11 +3276,13 @@ function createProxyServer(rawConfig, options = {}) {
           sendJson(response, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
           return;
         }
-        const html = renderDashboardHtml();
+        const html = renderDashboardHtml(managementToken);
         response.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
           'content-length': String(Buffer.byteLength(html)),
           'cache-control': 'no-store',
+          'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+          'x-frame-options': 'DENY',
         });
         response.end(html);
         return;
@@ -2825,7 +3322,7 @@ function createProxyServer(rawConfig, options = {}) {
     let bodyInfo = { parsed: null, rewritable: false, requestedModel: undefined, stream: false };
     try {
       if (request.method === 'POST') {
-        rawRequestBody = await readRequestBody(request);
+        rawRequestBody = await readRequestBody(request, config.limits.requestBodyBytes);
         rawRequestBytes = rawRequestBody.length;
         bodyInfo = inspectRequestBody(
           rawRequestBody,
@@ -2833,7 +3330,9 @@ function createProxyServer(rawConfig, options = {}) {
         );
       }
     } catch (error) {
-      sendJson(response, 400, { error: { message: error.message, type: 'invalid_request_error' } });
+      sendJson(response, error.statusCode || 400, {
+        error: { message: error.message, type: 'invalid_request_error' },
+      });
       return;
     }
 
@@ -2884,7 +3383,10 @@ function createProxyServer(rawConfig, options = {}) {
       logged = true;
       progressMetrics.status = finalStatus;
       progressMetrics.endedAt = process.hrtime.bigint();
-      progressMetrics.failed = finalStatus < 200 || finalStatus >= 400;
+      progressMetrics.failed = progressMetrics.failed
+        || finalStatus < 200
+        || finalStatus >= 400
+        || !response.writableFinished;
       monitor.finish(progressMetrics);
       const durationSeconds = elapsedSeconds(startedAt, progressMetrics.endedAt);
       const modelPart = progressMetrics.originalModel
@@ -2943,31 +3445,48 @@ function createProxyServer(rawConfig, options = {}) {
         + ` target=${upstreamUrl.origin}${upstreamUrl.pathname}`);
       let receivedResponse = false;
       let connectTimer;
+      let headersTimer;
+      let idleTimer;
+      const clearTimer = (timer) => {
+        if (timer) clearTimeout(timer);
+      };
+      const clearRequestTimers = () => {
+        clearTimer(connectTimer);
+        clearTimer(headersTimer);
+        clearTimer(idleTimer);
+      };
       const upstreamRequest = transport.request(upstreamUrl, {
         method: request.method,
         headers,
-        agent: (endpoint.name === 'responses' || endpoint.name === 'messages' || endpoint.name === 'chat') ? false : undefined,
+        agent: upstreamUrl.protocol === 'https:' ? httpsAgent : httpAgent,
       });
 
       upstreamRequest.once('socket', (socket) => {
-        const clearConnectTimer = () => {
-          if (connectTimer) clearTimeout(connectTimer);
+        const startHeadersTimer = () => {
+          clearTimer(connectTimer);
+          headersTimer = setTimeout(() => {
+            const error = new Error(`Upstream response headers timeout after ${config.timeouts.headersTimeoutMs}ms`);
+            error.code = 'ETIMEDOUT';
+            upstreamRequest.destroy(error);
+          }, config.timeouts.headersTimeoutMs);
+          headersTimer.unref();
         };
         if (socket.connecting) {
           const connectedEvent = upstreamUrl.protocol === 'https:' ? 'secureConnect' : 'connect';
-          socket.once(connectedEvent, clearConnectTimer);
+          socket.once(connectedEvent, startHeadersTimer);
           connectTimer = setTimeout(() => {
             const error = new Error(`Upstream connect timeout after ${config.timeouts.connectTimeoutMs}ms`);
             error.code = 'ETIMEDOUT';
             upstreamRequest.destroy(error);
           }, config.timeouts.connectTimeoutMs);
           connectTimer.unref();
-        }
+        } else startHeadersTimer();
       });
 
       upstreamRequest.once('response', (upstreamResponse) => {
         receivedResponse = true;
-        if (connectTimer) clearTimeout(connectTimer);
+        clearTimer(connectTimer);
+        clearTimer(headersTimer);
         finalStatus = upstreamResponse.statusCode || 502;
         progressMetrics.status = finalStatus;
         progress.update(progressMetrics);
@@ -2983,12 +3502,25 @@ function createProxyServer(rawConfig, options = {}) {
           return;
         }
 
+        const resetIdleTimer = () => {
+          if (config.timeouts.idleTimeoutMs === 0) return;
+          clearTimer(idleTimer);
+          idleTimer = setTimeout(() => {
+            const error = new Error(`Upstream response idle timeout after ${config.timeouts.idleTimeoutMs}ms`);
+            error.code = 'ETIMEDOUT';
+            upstreamResponse.destroy(error);
+          }, config.timeouts.idleTimeoutMs);
+          idleTimer.unref();
+        };
+        resetIdleTimer();
+
         if (endpoint.name === 'models'
           && config.injectMappedModels
           && finalStatus >= 200
           && finalStatus < 300) {
           const chunks = [];
           upstreamResponse.on('data', (chunk) => {
+            resetIdleTimer();
             const observedAt = process.hrtime.bigint();
             if (progressMetrics.firstByteAt === null) progressMetrics.firstByteAt = observedAt;
             progressMetrics.responseBytes += chunk.length;
@@ -2996,6 +3528,7 @@ function createProxyServer(rawConfig, options = {}) {
             progress.update(progressMetrics);
           });
           upstreamResponse.once('end', () => {
+            clearTimer(idleTimer);
             const originalBody = Buffer.concat(chunks);
             const injectedBody = injectMappedModels(
               originalBody,
@@ -3012,8 +3545,12 @@ function createProxyServer(rawConfig, options = {}) {
             response.end(responseBody);
           });
           upstreamResponse.once('error', (error) => {
+            clearTimer(idleTimer);
             debug(`request_id=${requestId} upstream_response_error=${error.code || error.message}`);
-            response.destroy(error);
+            if (response.headersSent) response.destroy(error);
+            else sendJson(response, error.code === 'ETIMEDOUT' ? 504 : 502, {
+              error: { message: error.message, type: 'upstream_connection_error' },
+            });
           });
           return;
         }
@@ -3039,6 +3576,7 @@ function createProxyServer(rawConfig, options = {}) {
         let jsonBytes = 0;
 
         upstreamResponse.on('data', (chunk) => {
+          resetIdleTimer();
           const observedAt = process.hrtime.bigint();
           if (progressMetrics.firstByteAt === null) progressMetrics.firstByteAt = observedAt;
           progressMetrics.responseBytes += chunk.length;
@@ -3056,6 +3594,7 @@ function createProxyServer(rawConfig, options = {}) {
         });
 
         upstreamResponse.once('end', () => {
+          clearTimer(idleTimer);
           if (observer) {
             const { completed, failed, done } = observer.state;
             progressMetrics.usage = observer.state.usage;
@@ -3069,6 +3608,7 @@ function createProxyServer(rawConfig, options = {}) {
           }
         });
         upstreamResponse.once('error', (error) => {
+          clearTimer(idleTimer);
           debug(`request_id=${requestId} upstream_response_error=${error.code || error.message}`);
           response.destroy(error);
         });
@@ -3076,7 +3616,7 @@ function createProxyServer(rawConfig, options = {}) {
       });
 
       upstreamRequest.once('error', (error) => {
-        if (connectTimer) clearTimeout(connectTimer);
+        clearRequestTimers();
         if (receivedResponse || response.headersSent || response.destroyed) {
           debug(`request_id=${requestId} stream_error=${error.code || error.message}`);
           if (!response.destroyed) response.destroy(error);
@@ -3087,9 +3627,14 @@ function createProxyServer(rawConfig, options = {}) {
         if (index + 1 < candidates.length) {
           tryCandidate(index + 1);
         } else {
-          finalStatus = 502;
-          sendJson(response, 502, {
-            error: { message: 'Unable to connect to upstream', type: 'upstream_connection_error' },
+          finalStatus = error.code === 'ETIMEDOUT' ? 504 : 502;
+          sendJson(response, finalStatus, {
+            error: {
+              message: error.code === 'ETIMEDOUT'
+                ? error.message
+                : 'Unable to connect to upstream',
+              type: 'upstream_connection_error',
+            },
           });
         }
       });
@@ -3116,6 +3661,8 @@ function createProxyServer(rawConfig, options = {}) {
     Promise.resolve(requestLog.flush()).finally(() => {
       server.close(callback);
       for (const socket of clientSockets) socket.destroy();
+      httpAgent.destroy();
+      httpsAgent.destroy();
     });
   };
 
@@ -3173,14 +3720,17 @@ if (require.main === module) {
 module.exports = {
   applyConfigMutation,
   buildLocalModelList,
+  buildModelProbeBody,
   cacheHitRate,
   costOfEntry,
   createSseObserver,
   entryCost,
+  extractProbePreview,
   matchPrice,
   normalizePricing,
   normalizeUsage,
   parseLogFilters,
+  pickProbeEndpoint,
   summarizeUsage,
   usageFromPayload,
   buildUpstreamUrl,

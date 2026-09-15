@@ -237,7 +237,7 @@ test('interactive progress renders colors, byte counts, first byte/text, and tot
     progress: { enabled: true, color: true, refreshIntervalMs: 50 },
   }), {
     log() {},
-    progress: { output: fakeTerminal, isTTY: true },
+    progress: { output: fakeTerminal, isTTY: true, colorEnabled: true },
   });
   const proxyPort = await listen(proxy);
   t.after(async () => { await close(proxy); await close(upstream); });
@@ -746,9 +746,9 @@ test('a group-qualified model name pins the request to that channel', async (t) 
   );
 });
 
-test('failover happens before downstream headers/body are sent', async (t) => {
+test('504 failover happens before downstream headers/body are sent', async (t) => {
   const first = http.createServer((req, res) => {
-    res.writeHead(503, { 'content-type': 'text/plain' });
+    res.writeHead(504, { 'content-type': 'text/plain' });
     res.end('first failed');
   });
   const second = http.createServer((req, res) => {
@@ -774,6 +774,71 @@ test('failover happens before downstream headers/body are sent', async (t) => {
   });
   assert.equal(result.statusCode, 200);
   assert.equal(result.body.toString(), 'event: response.completed\ndata: {"type":"response.completed"}\n\n');
+});
+
+test('an upstream that connects but never sends headers times out', async (t) => {
+  const upstream = http.createServer((req) => req.resume());
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, {
+    logging: { enabled: false },
+    timeouts: { connectTimeoutMs: 1000, headersTimeoutMs: 50, idleTimeoutMs: 0 },
+  }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  const result = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+  assert.equal(result.statusCode, 504);
+  assert.match(JSON.parse(result.body.toString()).error.message, /headers timeout/);
+});
+
+test('request bodies over the configured limit are rejected before proxying', async (t) => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamHits += 1;
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, {
+    logging: { enabled: false },
+    limits: { requestBodyBytes: 32 },
+  }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  const result = await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'x'.repeat(100) }),
+  });
+  assert.equal(result.statusCode, 413);
+  assert.equal(upstreamHits, 0);
+});
+
+test('upstream keep-alive reuses a connection for sequential requests', async (t) => {
+  let connections = 0;
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  upstream.on('connection', () => { connections += 1; });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, { logging: { enabled: false } }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  for (let index = 0; index < 2; index += 1) {
+    const result = await request({
+      port: proxyPort,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+    });
+    assert.equal(result.statusCode, 200);
+  }
+  assert.equal(connections, 1);
 });
 
 test('connection failure returns 502 and server can shut down cleanly', async () => {
@@ -993,6 +1058,34 @@ test('usage split across Anthropic stream events is merged into one record', asy
   assert.equal(totals.cacheReadTokens, 990);
 });
 
+test('a response.failed SSE event is recorded as a failed request', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('event: response.failed\ndata: {"type":"response.failed"}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, { logging: { enabled: false } }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: true }),
+  });
+
+  const failed = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/requests?status=failed', method: 'GET',
+  })).body.toString('utf8'));
+  assert.equal(failed.matched, 1);
+  assert.equal(failed.entries[0].failed, true);
+
+  const status = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/status', method: 'GET',
+  })).body.toString('utf8'));
+  assert.equal(status.latest.state, 'failed');
+});
+
 test('the request log separates cache hits from misses and reports per-group totals', async (t) => {
   const warm = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -1052,6 +1145,32 @@ test('the request log separates cache hits from misses and reports per-group tot
   assert.equal(stats.byModel['gpt-warm'].requests, 1);
 });
 
+test('stats count requests that have no usage payload', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end('{"error":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, { logging: { enabled: false } }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  await request({
+    port: proxyPort,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+  });
+
+  const stats = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/stats', method: 'GET',
+  })).body.toString('utf8'));
+  assert.equal(stats.overall.requests, 1);
+  assert.equal(stats.overall.usageRequests, 0);
+  assert.equal(stats.overall.failed, 1);
+  assert.equal(stats.byGroup.default.requests, 1);
+  assert.equal(stats.byGroup.default.failed, 1);
+});
+
 test('the dashboard is served on loopback and rejects remote callers', async (t) => {
   const proxy = createProxyServer({
     host: '127.0.0.1',
@@ -1081,6 +1200,65 @@ test('the dashboard is served on loopback and rejects remote callers', async (t)
   // Writes to the local surface are not an API; only GET is meaningful.
   const posted = await request({ port: proxyPort, path: '/_mini/stats', method: 'POST', body: '{}' });
   assert.equal(posted.statusCode, 404);
+});
+
+test('management writes reject cross-site requests and require the dashboard token', async (t) => {
+  const server = createProxyServer({
+    upstream: { baseUrl: 'http://127.0.0.1:9/v1', apiKey: '' },
+    models: { before: 'before' },
+    requestLog: { file: null },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); });
+  const payload = JSON.stringify({
+    action: 'saveModels',
+    payload: { name: 'default', models: { after: 'after' } },
+  });
+
+  const crossSite = await request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'POST',
+    headers: { 'content-type': 'text/plain', origin: 'https://evil.example' },
+    body: payload,
+  });
+  assert.equal(crossSite.statusCode, 415);
+
+  const page = await request({ port: proxyPort, path: '/_mini', method: 'GET' });
+  const token = page.body.toString('utf8').match(/const CSRF_TOKEN = "([^"]+)";/)?.[1];
+  assert.ok(token);
+  const origin = `http://127.0.0.1:${proxyPort}`;
+
+  const missingToken = await request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin },
+    body: payload,
+  });
+  assert.equal(missingToken.statusCode, 403);
+
+  const saved = await request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      origin,
+      'x-mini-codex-csrf': token,
+    },
+    body: payload,
+  });
+  assert.equal(saved.statusCode, 200);
+
+  const untrustedHost = await request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'GET',
+    headers: { host: 'evil.example' },
+  });
+  assert.equal(untrustedHost.statusCode, 403);
 });
 
 test('a request log file keeps one JSON record per line', async (t) => {
@@ -1447,6 +1625,43 @@ test('an invalid config edit is rejected and leaves the running proxy untouched'
   assert.equal(still.statusCode, 200);
 });
 
+test('a config persistence failure leaves the live routing unchanged', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mini-proxy-write-failure-'));
+  const invalidTarget = path.join(directory, 'config-target');
+  fs.mkdirSync(invalidTarget);
+  const tempFile = `${invalidTarget}.${process.pid}.tmp`;
+  const raw = {
+    upstream: { baseUrl: 'http://127.0.0.1:9/v1', apiKey: '' },
+    models: { before: 'before' },
+    requestLog: { file: null },
+    logging: { enabled: false },
+  };
+  const server = proxy.createProxyServer(raw, { configFile: invalidTarget, log() {} });
+  const proxyPort = await listen(server);
+  t.after(async () => {
+    await close(server);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const failed = await request({
+    port: proxyPort,
+    path: '/_mini/config',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      action: 'saveModels',
+      payload: { name: 'default', models: { after: 'after' } },
+    }),
+  });
+  assert.equal(failed.statusCode, 400);
+  assert.equal(fs.existsSync(tempFile), false);
+
+  const view = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/config', method: 'GET',
+  })).body.toString('utf8'));
+  assert.deepEqual(view.groups[0].models, { before: 'before' });
+});
+
 test('config edits are not persisted unless a configFile is supplied', async (t) => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -1498,6 +1713,32 @@ test('config mutations preserve unrelated groups and keep activeGroups consisten
     () => proxy.applyConfigMutation(raw, 'saveChannel', { name: 'has/slash' }),
     /must not contain/,
   );
+
+  const multi = {
+    groups: {
+      a: {
+        upstreams: [
+          { name: 'primary', baseUrl: 'https://a.test/v1', apiKey: 'a', priority: 10 },
+          { name: 'backup', baseUrl: 'https://b.test/v1', apiKey: 'b', priority: 1 },
+        ],
+        models: {},
+      },
+    },
+    activeGroups: ['a'],
+  };
+  const edited = proxy.applyConfigMutation(multi, 'saveChannel', {
+    name: 'a',
+    baseUrl: 'https://new.test/v1',
+    apiKey: '',
+    authStyle: 'bearer',
+    enabled: true,
+    endpoints: ['responses'],
+  });
+  assert.equal(edited.groups.a.upstreams.length, 2);
+  assert.equal(edited.groups.a.upstreams[0].name, 'primary');
+  assert.equal(edited.groups.a.upstreams[0].baseUrl, 'https://new.test/v1');
+  assert.equal(edited.groups.a.upstreams[0].apiKey, 'a');
+  assert.deepEqual(edited.groups.a.upstreams[1], multi.groups.a.upstreams[1]);
 });
 
 test('每组独立剥离请求体字段，不影响其他渠道与后续候选', async (t) => {
@@ -1608,6 +1849,7 @@ test('stripRequestFields 只在命中时改写请求体，并拒绝非法路径'
   assert.throws(() => withStrip('reasoning.summary'), /expected an array/);
   assert.throws(() => withStrip(['reasoning..summary']), /Invalid/);
   assert.throws(() => withStrip(['']), /Invalid/);
+  assert.throws(() => withStrip([{}]), /Invalid/);
 });
 
 test('思考等级从各家请求体格式中读取', () => {
@@ -1924,4 +2166,165 @@ test('invalid pricing entries are rejected while loading config', () => {
     () => validateAndNormalizeConfig({ ...base, pricing: { cacheReadMultiplier: -1 } }),
     /Invalid pricing\.cacheReadMultiplier/,
   );
+});
+
+test('model probe helpers build endpoint-specific bodies and extract previews', () => {
+  assert.equal(proxy.pickProbeEndpoint({ endpoints: new Set(['models']) }), null);
+  assert.equal(proxy.pickProbeEndpoint({ endpoints: new Set(['chat', 'models']) }).name, 'chat');
+  assert.equal(proxy.pickProbeEndpoint({ endpoints: new Set(['responses', 'chat']) }).name, 'responses');
+
+  assert.deepEqual(proxy.buildModelProbeBody('chat', 'gpt-x'), {
+    model: 'gpt-x',
+    messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
+    max_tokens: 16,
+    stream: false,
+  });
+  assert.equal(
+    proxy.extractProbePreview('chat', { choices: [{ message: { content: 'ok' } }] }),
+    'ok',
+  );
+  assert.equal(
+    proxy.extractProbePreview('messages', { content: [{ type: 'text', text: 'ok' }] }),
+    'ok',
+  );
+  assert.equal(
+    proxy.extractProbePreview('responses', {
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
+    }),
+    'ok',
+  );
+  assert.equal(
+    proxy.extractProbePreview('chat', { error: { message: 'nope' } }),
+    'nope',
+  );
+});
+
+test('dashboard model test probes a mapped alias against the primary upstream', async (t) => {
+  const seen = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    seen.push({
+      url: req.url,
+      authorization: req.headers.authorization,
+      body,
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'ok' } }],
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    groups: {
+      openai: {
+        upstream: {
+          name: 'gw',
+          baseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+          apiKey: 'sk-upstream',
+        },
+        models: {
+          'gpt-fast': 'gpt-real-mini',
+          'gpt-slow': 'gpt-real-full',
+        },
+        endpoints: ['chat', 'models'],
+      },
+    },
+    activeGroups: ['openai'],
+    requestLog: { file: null },
+    logging: { enabled: false },
+  });
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  const one = await request({
+    port: proxyPort,
+    path: '/_mini/config/test',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'openai', alias: 'gpt-fast' }),
+  });
+  assert.equal(one.statusCode, 200);
+  const oneBody = JSON.parse(one.body.toString('utf8'));
+  assert.equal(oneBody.name, 'openai');
+  assert.equal(oneBody.results.length, 1);
+  assert.equal(oneBody.results[0].ok, true);
+  assert.equal(oneBody.results[0].alias, 'gpt-fast');
+  assert.equal(oneBody.results[0].model, 'gpt-real-mini');
+  assert.equal(oneBody.results[0].endpoint, 'chat');
+  assert.equal(oneBody.results[0].preview, 'ok');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, '/v1/chat/completions');
+  assert.equal(seen[0].authorization, 'Bearer sk-upstream');
+  assert.equal(seen[0].body.model, 'gpt-real-mini');
+  assert.equal(seen[0].body.stream, false);
+
+  const all = await request({
+    port: proxyPort,
+    path: '/_mini/config/test',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'openai' }),
+  });
+  assert.equal(all.statusCode, 200);
+  const allBody = JSON.parse(all.body.toString('utf8'));
+  assert.equal(allBody.results.length, 2);
+  assert.ok(allBody.results.every((row) => row.ok));
+  assert.equal(seen.length, 3);
+
+  const missing = await request({
+    port: proxyPort,
+    path: '/_mini/config/test',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'openai', alias: 'nope' }),
+  });
+  assert.equal(missing.statusCode, 400);
+});
+
+test('dashboard model test reports upstream failures without writing request logs', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'bad key' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const server = createProxyServer(makeConfig(upstreamPort, {
+    logging: { enabled: false },
+    groups: {
+      default: {
+        upstream: {
+          name: 'test-upstream',
+          baseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+          apiKey: 'server-secret-key',
+        },
+        models: { 'gpt-5.6-sol': 'gpt-5.4' },
+        endpoints: ['responses', 'chat', 'models'],
+      },
+    },
+    activeGroups: ['default'],
+  }));
+  const proxyPort = await listen(server);
+  t.after(async () => { await close(server); await close(upstream); });
+
+  const result = await request({
+    port: proxyPort,
+    path: '/_mini/config/test',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'default', alias: 'gpt-5.6-sol' }),
+  });
+  assert.equal(result.statusCode, 200);
+  const body = JSON.parse(result.body.toString('utf8'));
+  assert.equal(body.results[0].ok, false);
+  assert.equal(body.results[0].status, 401);
+  assert.match(body.results[0].error, /bad key/);
+  assert.equal(body.results[0].endpoint, 'responses');
+
+  const logged = JSON.parse((await request({
+    port: proxyPort, path: '/_mini/requests', method: 'GET',
+  })).body.toString('utf8'));
+  assert.equal(logged.matched, 0);
 });
