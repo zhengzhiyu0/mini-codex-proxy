@@ -272,6 +272,7 @@ body.model = configuredMapping[body.model] ?? body.model;
 - `models`
 - `endpoints`：这一组接受哪些接口，取值 `responses`、`messages`、`chat`、`models`；不写表示全部
 - `priority`：组之间的优先级，数值大的先尝试，默认 `0`
+- `stripRequestFields`：转发前从请求体里删掉的字段，见下一节
 - `injectMappedModels`
 - `overrideModelList`
 
@@ -326,6 +327,37 @@ OpenAI 和 Claude 渠道混合启用：
 只有支持当前接口（`endpoints`）的组才会参与。如果没有任何组支持这个接口或这个模型，代理返回 `404`，不会去连上游。
 
 每组保留自己的映射：同一个别名 `shared` 在 A 组映射成 `a-model`、在 B 组映射成 `b-model` 时，切换到 B 组重试会改写成 `b-model`，不会把 A 组的目标名带过去。
+
+### 按渠道剥离请求字段
+
+有些网关不接受客户端默认会发的某个字段，例如把请求转给 Bedrock 上的 `openai.*` 模型时，`reasoning.summary` 会被直接拒掉：
+
+```
+Unsupported parameter: 'reasoning.summary' is not supported with the 'openai.gpt-5.6-sol' model.
+```
+
+给这一组配 `stripRequestFields`，代理转发前就会把这些字段删掉，客户端不用改：
+
+```json
+{
+  "groups": {
+    "picky-gateway": {
+      "upstream": { "baseUrl": "https://example.com/v2", "apiKey": "sk-..." },
+      "models": { "gpt-5.6-sol": "gpt-5.6-sol" },
+      "endpoints": ["responses"],
+      "stripRequestFields": ["reasoning.summary"]
+    }
+  }
+}
+```
+
+几个要点：
+
+- 写点号路径（`a.b.c`）删嵌套字段，只删这一个叶子，同级的 `reasoning.effort` 不受影响。
+- 只对本组生效。失败顺延到下一组时，下一组收到的是未改动的原始请求体。
+- 路径不存在就跳过，不会报错，也不会白改一遍请求体。
+- 请求体不是 JSON、或带了压缩编码时不做处理，原样转发。
+- 面板「编辑渠道」里也能填，多个字段用逗号分隔。
 
 ### 上游认证方式
 
@@ -753,6 +785,10 @@ Copy-Item .\config.example.json .\config.json
 ### 上游返回 401/403
 
 如果错误来自 mini-codex-proxy，检查 CC Switch 的 API Key 是否与 `clientApiKey` 完全一致。如果错误来自上游，检查 `upstream.apiKey`。上游已经返回的错误状态码和 body 会原样转发，不会被统一包装。
+
+### 上游返回 400 且提示 `Unsupported parameter`
+
+上游不认客户端带的某个字段，例如 `Unsupported parameter: 'reasoning.summary' is not supported with the 'openai.gpt-5.6-sol' model.`。给这一组加 `stripRequestFields`，见[按渠道剥离请求字段](#按渠道剥离请求字段)。
 
 ### Codex 无法使用模型名
 

@@ -1500,6 +1500,116 @@ test('config mutations preserve unrelated groups and keep activeGroups consisten
   );
 });
 
+test('每组独立剥离请求体字段，不影响其他渠道与后续候选', async (t) => {
+  const seen = [];
+  const strict = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    seen.push({ group: 'strict', body });
+    // Mimic a gateway that 400s on reasoning.summary; here the field must already be gone.
+    if (body.reasoning && 'summary' in body.reasoning) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"Unsupported parameter: reasoning.summary"}}');
+      return;
+    }
+    res.writeHead(503, { 'content-type': 'text/plain' });
+    res.end('down');
+  });
+  const relaxed = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({ group: 'relaxed', body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"id":"resp_relaxed"}');
+  });
+  const strictPort = await listen(strict);
+  const relaxedPort = await listen(relaxed);
+  const proxyServer = createProxyServer({
+    host: '127.0.0.1',
+    port: 8317,
+    activeGroups: 'all',
+    groups: {
+      strict: {
+        priority: 100,
+        upstream: { name: 'strict', baseUrl: `http://127.0.0.1:${strictPort}/v1`, apiKey: '' },
+        models: { 'gpt-5.6-sol': 'gpt-5.6-sol' },
+        endpoints: ['responses'],
+        stripRequestFields: ['reasoning.summary', 'absent.path'],
+      },
+      relaxed: {
+        priority: 1,
+        upstream: { name: 'relaxed', baseUrl: `http://127.0.0.1:${relaxedPort}/v1`, apiKey: '' },
+        models: { 'gpt-5.6-sol': 'gpt-5.6-sol' },
+        endpoints: ['responses'],
+      },
+    },
+    logging: { enabled: false },
+  }, { log() {} });
+  const proxyPort = await listen(proxyServer);
+  t.after(async () => {
+    await close(proxyServer); await close(strict); await close(relaxed);
+  });
+
+  const input = {
+    model: 'gpt-5.6-sol',
+    input: 'hi',
+    reasoning: { effort: 'xhigh', summary: 'auto' },
+    metadata: { keep: true },
+  };
+  const result = await request({
+    port: proxyPort,
+    path: '/v1/responses',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.toString(), '{"id":"resp_relaxed"}');
+  assert.deepEqual(seen.map((entry) => entry.group), ['strict', 'relaxed']);
+  // Only the listed leaf is dropped; its siblings and the rest of the body survive.
+  assert.deepEqual(seen[0].body, {
+    model: 'gpt-5.6-sol',
+    input: 'hi',
+    reasoning: { effort: 'xhigh' },
+    metadata: { keep: true },
+  });
+  // The next candidate sees the untouched original, not the stripped body.
+  assert.deepEqual(seen[1].body, input);
+});
+
+test('stripRequestFields 只在命中时改写请求体，并拒绝非法路径', () => {
+  const info = proxy.inspectRequestBody(
+    Buffer.from(JSON.stringify({ model: 'm', reasoning: { effort: 'high', summary: 'auto' } })),
+    null,
+  );
+  const original = Buffer.from('original');
+
+  // Nothing to strip and no model change: the untouched buffer is forwarded as-is.
+  assert.equal(proxy.bodyWithModel(original, info, 'm', []), original);
+  assert.equal(proxy.bodyWithModel(original, info, 'm', [['nope']]), original);
+  // A hit rewrites the body, and repeated calls do not mutate the parsed payload.
+  const stripped = proxy.bodyWithModel(original, info, 'm', [['reasoning', 'summary']]);
+  assert.deepEqual(JSON.parse(stripped.toString()), { model: 'm', reasoning: { effort: 'high' } });
+  assert.deepEqual(info.parsed.reasoning, { effort: 'high', summary: 'auto' });
+  // Stripping and model mapping combine in one rewrite.
+  assert.deepEqual(
+    JSON.parse(proxy.bodyWithModel(original, info, 'target', [['reasoning', 'summary']]).toString()),
+    { model: 'target', reasoning: { effort: 'high' } },
+  );
+
+  const withStrip = (value) => validateAndNormalizeConfig({
+    upstream: { baseUrl: 'https://a.test/v1' },
+    stripRequestFields: value,
+  });
+  assert.deepEqual(withStrip(['reasoning.summary']).groups.default.stripRequestFields,
+    [['reasoning', 'summary']]);
+  assert.deepEqual(withStrip(undefined).groups.default.stripRequestFields, []);
+  assert.throws(() => withStrip('reasoning.summary'), /expected an array/);
+  assert.throws(() => withStrip(['reasoning..summary']), /Invalid/);
+  assert.throws(() => withStrip(['']), /Invalid/);
+});
+
 test('思考等级从各家请求体格式中读取', () => {
   const effortOf = (payload) => proxy
     .inspectRequestBody(Buffer.from(JSON.stringify(payload)), null)

@@ -23,6 +23,9 @@
         "chat",
         "models"
       ],
+      "stripRequestFields": [
+        "reasoning.summary"
+      ],
       "injectMappedModels": true,
       "overrideModelList": false
     },

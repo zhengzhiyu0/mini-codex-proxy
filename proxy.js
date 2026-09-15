@@ -132,6 +132,30 @@ function normalizeEndpoints(input, fieldName) {
   return result;
 }
 
+// Dot paths of request-body fields this group must drop before forwarding, e.g.
+// "reasoning.summary" for gateways that reject the field on some upstream models.
+// Accepts ["a.b"] from config.json or [["a","b"]] when a normalized config is re-validated.
+function normalizeStripRequestFields(input, fieldName) {
+  if (input === undefined) return [];
+  if (!Array.isArray(input)) {
+    throw new Error(`Invalid ${fieldName}: expected an array`);
+  }
+  const paths = [];
+  const seen = new Set();
+  for (const item of input) {
+    const segments = (Array.isArray(item) ? item : String(item ?? '').split('.'))
+      .map((part) => (typeof part === 'string' ? part.trim() : ''));
+    if (segments.length === 0 || segments.some((part) => !part)) {
+      throw new Error(`Invalid ${fieldName} entry: ${JSON.stringify(item)}`);
+    }
+    const key = segments.join('.');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    paths.push(segments);
+  }
+  return paths;
+}
+
 function normalizeAuthStyle(value, fieldName) {
   if (value === undefined) return 'bearer';
   const style = typeof value === 'string' ? value.trim().toLowerCase() : '';
@@ -218,6 +242,10 @@ function normalizeGroup(input, name, fieldPrefix) {
     upstreams: normalizeUpstreams(input, fieldPrefix),
     models: normalizeModels(input.models, `${fieldPrefix}models`),
     endpoints: normalizeEndpoints(input.endpoints, `${fieldPrefix}endpoints`),
+    stripRequestFields: normalizeStripRequestFields(
+      input.stripRequestFields,
+      `${fieldPrefix}stripRequestFields`,
+    ),
     priority: Number.isFinite(input.priority) ? input.priority : 0,
     injectMappedModels: input.injectMappedModels === true,
     overrideModelList: input.overrideModelList === true,
@@ -560,15 +588,40 @@ function inspectRequestBody(body, contentEncoding) {
   return result;
 }
 
-function bodyWithModel(originalBody, info, targetModel) {
-  if (!info.rewritable
-    || info.requestedModel === undefined
-    || typeof targetModel !== 'string'
-    || targetModel === info.requestedModel) {
-    return originalBody;
+// Removes one dot path, copying only the objects along the way so `info.parsed`
+// stays untouched for the next candidate. Returns the input when nothing matched.
+function withoutPath(value, segments) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const [head, ...rest] = segments;
+  if (!Object.prototype.hasOwnProperty.call(value, head)) return value;
+  if (rest.length === 0) {
+    const copy = { ...value };
+    delete copy[head];
+    return copy;
   }
+  const child = withoutPath(value[head], rest);
+  if (child === value[head]) return value;
+  return { ...value, [head]: child };
+}
+
+// Builds the body for one candidate: the group's target model plus that group's
+// `stripRequestFields` removals. Returns the original buffer when neither applies.
+function bodyWithModel(originalBody, info, targetModel, stripPaths = []) {
+  if (!info.rewritable) return originalBody;
+
+  const needsModel = info.requestedModel !== undefined
+    && typeof targetModel === 'string'
+    && targetModel !== info.requestedModel;
+
+  let parsed = info.parsed;
+  for (const segments of stripPaths) {
+    parsed = withoutPath(parsed, segments);
+  }
+  const stripped = parsed !== info.parsed;
+  if (!needsModel && !stripped) return originalBody;
+
   // Spread keeps the original key order; `model` already exists so only its value changes.
-  return Buffer.from(JSON.stringify({ ...info.parsed, model: targetModel }));
+  return Buffer.from(JSON.stringify(needsModel ? { ...parsed, model: targetModel } : parsed));
 }
 
 function prepareRequestHeaders(clientHeaders, upstream, config, body, forceIdentityEncoding) {
@@ -1839,7 +1892,10 @@ function renderChannels() {
       + (up.hasApiKey ? ' · ' + esc(up.apiKeyMasked) : ' · 无 key')
       + ' · 优先级 ' + g.priority
       + ' · ' + esc(g.endpoints.join('/'))
-      + ' · ' + Object.keys(g.models).length + ' 个模型</span>'
+      + ' · ' + Object.keys(g.models).length + ' 个模型'
+      + ((g.stripRequestFields || []).length
+        ? ' · 剥离 ' + esc(g.stripRequestFields.join('/')) : '')
+      + '</span>'
       + '<button class="act" data-toggle="' + esc(g.name) + '">'
       + (g.enabled ? '停用' : '启用') + '</button>'
       + '<button class="act" data-edit="' + esc(g.name) + '">编辑</button>'
@@ -1948,6 +2004,7 @@ async function mutate(action, payload, okMessage) {
 function openChannelDialog(existing) {
   const g = existing || {
     name: '', enabled: true, priority: 0, endpoints: ['responses', 'chat', 'models'],
+    stripRequestFields: [],
     upstreams: [{ baseUrl: '', authStyle: 'bearer', apiKeyMasked: '' }],
   };
   const up = g.upstreams[0] || {};
@@ -1972,7 +2029,10 @@ function openChannelDialog(existing) {
     + ['responses', 'messages', 'chat', 'models'].map((e) => '<span style="margin-right:10px">'
       + '<input type="checkbox" class="dEp" value="' + e + '"'
       + (g.endpoints.includes(e) ? ' checked' : '') + '> ' + e + '</span>').join('')
-    + '</span></label>';
+    + '</span></label>'
+    + '<label style="grid-column:1/-1">剥离请求字段<input id="dStrip" value="'
+    + esc((g.stripRequestFields || []).join(', '))
+    + '" placeholder="例如 reasoning.summary, 多个用逗号分隔（留空表示不剥离）"></label>';
   $('dlg').showModal();
 }
 
@@ -1988,6 +2048,7 @@ function submitChannelDialog() {
     priority: Number($('dPri').value) || 0,
     enabled: $('dOn').value === '1',
     endpoints,
+    stripRequestFields: $('dStrip').value.split(',').map((s) => s.trim()).filter(Boolean),
   }, '渠道已保存并生效');
 }
 
@@ -2199,6 +2260,7 @@ function buildConfigView(raw, config) {
         models: raw.models,
         endpoints: raw.endpoints,
         priority: raw.priority,
+        stripRequestFields: raw.stripRequestFields,
       },
     };
 
@@ -2213,6 +2275,8 @@ function buildConfigView(raw, config) {
       enabled: config.activeGroups.includes(name),
       priority: Number.isFinite(group.priority) ? group.priority : 0,
       endpoints: group.endpoints ? [...group.endpoints] : [...ENDPOINT_NAMES],
+      stripRequestFields: normalizeStripRequestFields(group.stripRequestFields, 'stripRequestFields')
+        .map((segments) => segments.join('.')),
       injectMappedModels: group.injectMappedModels === true,
       overrideModelList: group.overrideModelList === true,
       models: { ...(group.models || {}) },
@@ -2269,10 +2333,11 @@ function applyConfigMutation(raw, action, payload = {}) {
         priority: raw.priority,
         injectMappedModels: raw.injectMappedModels,
         overrideModelList: raw.overrideModelList,
+        stripRequestFields: raw.stripRequestFields,
       },
     };
     for (const key of ['upstream', 'upstreams', 'models', 'endpoints', 'priority',
-      'injectMappedModels', 'overrideModelList']) {
+      'injectMappedModels', 'overrideModelList', 'stripRequestFields']) {
       if (next.groups.default[key] === undefined) delete next.groups.default[key];
       delete next[key];
     }
@@ -2308,6 +2373,14 @@ function applyConfigMutation(raw, action, payload = {}) {
         ? [...payload.endpoints]
         : (existing?.endpoints || [...ENDPOINT_NAMES]),
     };
+    // An absent key keeps the current list; an empty array clears it.
+    if (Array.isArray(payload.stripRequestFields)) {
+      groups[name].stripRequestFields = normalizeStripRequestFields(
+        payload.stripRequestFields,
+        'stripRequestFields',
+      ).map((segments) => segments.join('.'));
+      if (groups[name].stripRequestFields.length === 0) delete groups[name].stripRequestFields;
+    }
     delete groups[name].upstreams;
     activeGroups = setGroupActive(activeGroups, name, payload.enabled !== false);
   } else if (action === 'deleteChannel') {
@@ -2850,7 +2923,7 @@ function createProxyServer(rawConfig, options = {}) {
       const { group, upstream, targetModel } = current;
       currentBody = rawRequestBody === null
         ? null
-        : bodyWithModel(rawRequestBody, bodyInfo, targetModel);
+        : bodyWithModel(rawRequestBody, bodyInfo, targetModel, group.stripRequestFields);
       progressMetrics.group = group.name;
       progressMetrics.upstream = upstream.name;
       progressMetrics.mappedModel = targetModel;
